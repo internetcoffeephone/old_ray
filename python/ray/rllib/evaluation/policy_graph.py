@@ -100,7 +100,7 @@ class PolicyGraph(object):
             state_outs (list): list of RNN state outputs, if any
             info (dict): dictionary of extra features, if any
         """
-
+        import pdb; pdb.set_trace()
         prev_action_batch = None
         prev_reward_batch = None
         info_batch = None

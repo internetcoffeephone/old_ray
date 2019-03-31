@@ -394,6 +394,7 @@ class Agent(Trainable):
             info (dict): info object, if any
             policy_id (str): policy to query (only applies to multi-agent).
         """
+        import pdb; pdb.set_trace()
         episode = None
         if 'all_agent_actions' in info.keys():
             episode = info
