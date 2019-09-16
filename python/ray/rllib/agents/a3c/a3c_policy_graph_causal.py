@@ -32,22 +32,21 @@ def kl_div(p, q):
     p = np.asarray(p, dtype=np.float)
     q = np.asarray(q, dtype=np.float)
 
-    kl = np.sum(np.where(p != 0, p * np.log(p / q), 0), axis=-1)
-
-    # Don't return nans or infs
-    if np.all(np.isfinite(kl)):
-        return kl
-    else:
-        return np.zeros(kl.shape)
+    return np.sum(np.where(p != 0, p * np.log(p / q), 0), axis=-1)
 
 
-def agent_name_to_idx(name, self_id):
+def agent_name_to_visibility_idx(name, self_id):
     agent_num = int(name[6])
     self_num = int(self_id[6])
     if agent_num > self_num:
         return agent_num - 1
     else:
         return agent_num
+
+
+def agent_name_to_idx(name):
+    agent_num = int(name[6])
+    return agent_num
 
 
 class A3CLoss(object):
@@ -101,7 +100,7 @@ class MOALoss(object):
             others_visibility = tf.reshape(others_visibility[1:,:], [-1])
             self.ce_per_entry *= tf.cast(others_visibility, tf.float32)
 
-        self.total_loss = tf.reduce_mean(self.ce_per_entry)
+        self.total_loss = tf.reduce_mean(self.ce_per_entry) * loss_weight
         tf.Print(self.total_loss, [self.total_loss], message="MOA CE loss")
 
 
@@ -124,9 +123,6 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         self.influence_reward_weight = cust_opts['influence_reward_weight']
         self.influence_curriculum_steps = cust_opts['influence_curriculum_steps']
         self.influence_only_when_visible = cust_opts['influence_only_when_visible']
-        self.inf_scale_start = cust_opts['influence_scaledown_start']
-        self.inf_scale_end = cust_opts['influence_scaledown_end']
-        self.inf_scale_final_val = cust_opts['influence_scaledown_final_val']
 
         # Use to compute increasing influence curriculum weight
         self.steps_processed = 0
@@ -269,10 +265,20 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         builder.add_feed_dict(self.extra_compute_action_feed_dict())
 
         # Extract matrix of other agents' past actions, including agent's own
-        own_actions = np.atleast_2d(np.array(
-            [e.prev_action for e in episodes[self.agent_id]]))
-        all_actions = self.extract_last_actions_from_episodes(
-            episodes, own_actions=own_actions)
+        if type(episodes) == dict and 'all_agents_actions' in episodes.keys():
+            # Call from visualizer_rllib, change episodes format so it complies with the default format.
+            self_index = agent_name_to_idx(self.agent_id, self.agent_id)
+            # First get own action
+            all_actions = [episodes['all_agents_actions'][self_index]]
+            others_actions = [e for i, e in enumerate(
+                episodes['all_agents_actions']) if self_index != i]
+            all_actions.extend(others_actions)
+            all_actions = np.reshape(np.array(all_actions), [1, -1])
+        else:
+            own_actions = np.atleast_2d(np.array(
+                [e.prev_action for e in episodes[self.agent_id]]))
+            all_actions = self.extract_last_actions_from_episodes(
+                episodes, own_actions=own_actions)
 
         builder.add_feed_dict({self._obs_input: obs_batch,
                                self.others_actions: all_actions})
@@ -376,7 +382,7 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
                                episode=None):
         # Extract matrix of self and other agents' actions.
         own_actions = np.atleast_2d(np.array(sample_batch['actions']))
-        own_actions = np.reshape(own_actions, [-1,1])
+        own_actions = np.reshape(own_actions, [-1, 1])
         all_actions = self.extract_last_actions_from_episodes(
             other_agent_batches, own_actions=own_actions, batch_type=True)
         sample_batch['others_actions'] = all_actions
@@ -459,27 +465,15 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         visibility = np.zeros((traj_len, self.num_other_agents))
         vis_lists = [info['visible_agents'] for info in trajectory['infos']]
         for i, v in enumerate(vis_lists):
-            vis_agents = [agent_name_to_idx(a, self.agent_id) for a in v]
+            vis_agents = [agent_name_to_visibility_idx(a, self.agent_id) for a in v]
             visibility[i, vis_agents] = 1
         return visibility
 
     def current_influence_curriculum_weight(self):
-        """ Computes multiplier for influence reward based on training steps 
-        taken and curriculum parameters.
-
-        Returns: scalar float influence weight
-        """
-        if self.steps_processed < self.influence_curriculum_steps:
-            percent = float(self.steps_processed) / self.influence_curriculum_steps
-            return percent * self.influence_reward_weight
-        elif self.steps_processed > self.influence_opts['influence_scaledown_start']:
-            percent = (self.steps_processed - self.inf_scale_start) \
-                / float(self.inf_scale_end - self.inf_scale_start)
-            diff = self.influence_reward_weight - self.inf_scale_final_val
-            scaled = self.influence_reward_weight - diff * percent
-            return max(self.inf_scale_final_val, scaled)
-        else:
+        if self.steps_processed > self.influence_curriculum_steps:
             return self.influence_reward_weight
+        percent = float(self.steps_processed) / self.influence_curriculum_steps
+        return percent * self.influence_reward_weight
 
     def marginalize_predictions_over_own_actions(self, trajectory):
         # Run policy to get probability of each action in original trajectory

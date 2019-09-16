@@ -20,14 +20,8 @@ from ray.rllib.utils.annotations import override
 
 
 def agent_name_to_idx(name):
-    # TODO(nj) what was this supposed to do?
     agent_num = int(name[6])
     return agent_num
-    # self_num = int(self_id[6])
-    # if agent_num > self_num:
-    #     return agent_num - 1
-    # else:
-    #     return agent_num
 
 
 class A3CLoss(object):
@@ -195,7 +189,6 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
             import pdb; pdb.set_trace()
 
         # FIXME(ev) does this work normally?
-        # This is a hack to make replay work I think?
         if type(episodes) == dict and 'all_agents_actions' in episodes.keys():
             if exclude_self:
                 self_index = agent_name_to_idx(self.agent_id)

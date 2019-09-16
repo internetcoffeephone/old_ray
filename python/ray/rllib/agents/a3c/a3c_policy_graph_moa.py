@@ -19,13 +19,18 @@ from ray.rllib.models.catalog import ModelCatalog
 from ray.rllib.utils.annotations import override
 
 
-def agent_name_to_idx(name, self_id):
+def agent_name_to_visibility_idx(name, self_id):
     agent_num = int(name[6])
     self_num = int(self_id[6])
     if agent_num > self_num:
         return agent_num - 1
     else:
         return agent_num
+
+
+def agent_name_to_idx(name):
+    agent_num = int(name[6])
+    return agent_num
 
 
 class A3CLoss(object):
@@ -79,7 +84,7 @@ class MOALoss(object):
             others_visibility = tf.reshape(others_visibility[1:,:], [-1])
             self.ce_per_entry *= tf.cast(others_visibility, tf.float32)
 
-        self.total_loss = tf.reduce_mean(self.ce_per_entry)
+        self.total_loss = tf.reduce_mean(self.ce_per_entry) * loss_weight
         tf.Print(self.total_loss, [self.total_loss], message="MOA CE loss")
 
 
@@ -253,7 +258,7 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         visibility = np.zeros((traj_len, self.num_other_agents))
         vis_lists = [info['visible_agents'] for info in trajectory['infos']]
         for i, v in enumerate(vis_lists):
-            vis_agents = [agent_name_to_idx(a, self.agent_id) for a in v]
+            vis_agents = [agent_name_to_visibility_idx(a, self.agent_id) for a in v]
             visibility[i, vis_agents] = 1
         return visibility
 
@@ -314,10 +319,20 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         builder.add_feed_dict(self.extra_compute_action_feed_dict())
 
         # Extract matrix of other agents' past actions, including agent's own
-        own_actions = np.atleast_2d(np.array(
-            [e.prev_action for e in episodes[self.agent_id]]))
-        all_actions = self.extract_last_actions_from_episodes(
-            episodes, own_actions=own_actions)
+        if type(episodes) == dict and 'all_agents_actions' in episodes.keys():
+            # Call from visualizer_rllib, change episodes format so it complies with the default format.
+            self_index = agent_name_to_idx(self.agent_id)
+            # First get own action
+            all_actions = [episodes['all_agents_actions'][self_index]]
+            others_actions = [e for i, e in enumerate(
+                episodes['all_agents_actions']) if self_index != i]
+            all_actions.extend(others_actions)
+            all_actions = np.reshape(np.array(all_actions), [1, -1])
+        else:
+            own_actions = np.atleast_2d(np.array(
+                [e.prev_action for e in episodes[self.agent_id]]))
+            all_actions = self.extract_last_actions_from_episodes(
+                episodes, own_actions=own_actions)
 
         # Debugging:
         # if self.agent_id == 'agent-0':
