@@ -188,7 +188,6 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
             print("Why are there no episodes?")
             import pdb; pdb.set_trace()
 
-        # FIXME(ev) does this work normally?
         if type(episodes) == dict and 'all_agents_actions' in episodes.keys():
             if exclude_self:
                 self_index = agent_name_to_idx(self.agent_id)
@@ -235,14 +234,6 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
 
         # Need to compute other agents' actions.
         others_actions = self.extract_last_actions_from_episodes(episodes)
-
-        # Debugging:
-        # if self.agent_id == 'agent-0':
-            # agent_ids = sorted(episodes.keys())
-            # prev_actions = []
-            # for agent_id in agent_ids:
-            #     prev_actions.append([e.prev_action for e in episodes[agent_id]])
-            # print(np.transpose(np.array(prev_actions)))
 
         builder.add_feed_dict({self._obs_input: obs_batch,
                                self.others_actions: others_actions})
