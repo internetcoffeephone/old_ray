@@ -215,7 +215,7 @@ class ModelCatalog(object):
             copy = dict(input_dict)
             copy["obs"] = model.last_layer
             feature_space = gym.spaces.Box(
-                -1, 1, shape=(model.last_layer.shape[1], ))
+                -1, 1, shape=(model.last_layer.shape[1], ), dtype=np.float32)
             model = LSTM(copy, feature_space, num_outputs, options, state_in,
                          seq_lens)
 
@@ -414,7 +414,7 @@ class ModelCatalog(object):
             copy = dict(input_dict)
             copy["obs"] = model.last_layer
             feature_space = gym.spaces.Box(
-                -1, 1, shape=(model.last_layer.shape[1], ))
+                -1, 1, shape=(model.last_layer.shape[1], ), dtype=np.float32)
             lstm1 = LSTM(copy, feature_space, num_outputs_lstm1, options, state_in1,
                         seq_lens2)
 
@@ -429,7 +429,7 @@ class ModelCatalog(object):
             copy = dict(input_dict)
             copy["obs"] = model.last_layer
             feature_space = gym.spaces.Box(
-                -1, 1, shape=(model.last_layer.shape[1], ))
+                -1, 1, shape=(model.last_layer.shape[1], ), dtype=np.float32)
             lstm2 = LSTM(copy, feature_space, num_outputs_lstm2, options, state_in2,
                         seq_lens2)
 
