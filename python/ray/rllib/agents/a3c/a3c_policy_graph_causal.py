@@ -31,14 +31,13 @@ def kl_div(p, q):
     """
     p = np.asarray(p, dtype=np.float)
     q = np.asarray(q, dtype=np.float)
+    mask = np.where(q == 0)
+    # Prevent division by 0 errors.
+    p[mask] = 0
+    p = p / p.sum(axis=2, keepdims=1)
 
-    kl = np.sum(np.where(p != 0, p * np.log(p / q), 0), axis=-1)
+    return np.sum(np.where((p != 0) & (q != 0), p * np.log(p / q), 0), axis=-1)
 
-    # Don't return nans or infs
-    if np.all(np.isfinite(kl)):
-        return kl
-    else:
-        return np.zeros(kl.shape)
 
 def agent_name_to_visibility_idx(name, self_id):
     agent_num = int(name[6])
