@@ -5,6 +5,7 @@ from __future__ import division
 from __future__ import print_function
 
 import tensorflow as tf
+import numpy as np
 import gym
 
 import ray
@@ -16,6 +17,39 @@ from ray.rllib.evaluation.tf_policy_graph import TFPolicyGraph, \
     LearningRateSchedule
 from ray.rllib.models.catalog import ModelCatalog
 from ray.rllib.utils.annotations import override
+
+
+def kl_div(p, q):
+    """Kullback-Leibler divergence D(P || Q) for discrete probability dists
+
+    Assumes the probability dist is over the last dimension.
+
+    Taken from: https://gist.github.com/swayson/86c296aa354a555536e6765bbe726ff7
+
+    p, q : array-like, dtype=float
+    """
+    p = np.asarray(p, dtype=np.float)
+    q = np.asarray(q, dtype=np.float)
+    mask = np.where(q == 0)
+    # Prevent division by 0 errors.
+    p[mask] = 0
+    p = p / p.sum(axis=2, keepdims=1)
+
+    return np.sum(np.where((p != 0) & (q != 0), p * np.log(p / q), 0), axis=-1)
+
+
+def agent_name_to_visibility_idx(name, self_id):
+    agent_num = int(name[6])
+    self_num = int(self_id[6])
+    if agent_num > self_num:
+        return agent_num - 1
+    else:
+        return agent_num
+
+
+def agent_name_to_idx(name):
+    agent_num = int(name[6])
+    return agent_num
 
 
 class A3CLoss(object):
@@ -39,27 +73,99 @@ class A3CLoss(object):
                            self.entropy * entropy_coeff)
 
 
+class CuriosityLoss(object):
+    def __init__(self, pred_states, true_states, loss_weight=1.0):
+        """Curiosity loss with supervised MSE loss on a trajectory.
+
+        The loss is based on the difference between the predicted encoding of the observation x at t+1 based on t,
+         and the true encoding x at t+1.
+         The loss is then -log(p(xt+1)|xt, at)
+         Difference is measured as mean-squared error corresponding to a fixed-variance Gaussian density.
+
+        Returns:
+            A scalar loss tensor.
+        """
+        # Remove the prediction for the final step, since t+1 is not known for
+        # this step.
+        pred_states = pred_states[:-1, :]  # [B, N]
+
+        # Remove first true state, as we have nothing to predict this from.
+        # the t+1 actions of other agents from all actions at t.
+        true_states = true_states[1:, :]
+
+        # Compute mean squared error of difference between prediction and truth
+        mse = tf.losses.mean_squared_error(true_states, pred_states)
+
+        self.total_loss = mse * loss_weight
+        tf.print("Curiosity loss", self.total_loss, [self.total_loss])
+
+
 class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
     def __init__(self, observation_space, action_space, config):
         config = dict(ray.rllib.agents.a3c.a3c.DEFAULT_CONFIG, **config)
         self.config = config
         self.sess = tf.get_default_session()
 
+        # Extract info from config
+        self.num_other_agents = config['num_other_agents']
+        self.agent_id = config['agent_id']
+
+        # Extract influence options
+        cust_opts = config['model']['custom_options']
+        self.moa_weight = cust_opts['moa_weight']
+        self.train_moa_only_when_visible = cust_opts['train_moa_only_when_visible']
+        self.influence_reward_clip = cust_opts['influence_reward_clip']
+        self.influence_divergence_measure = cust_opts['influence_divergence_measure']
+        self.influence_reward_weight = cust_opts['influence_reward_weight']
+        self.influence_curriculum_steps = cust_opts['influence_curriculum_steps']
+        self.influence_only_when_visible = cust_opts['influence_only_when_visible']
+        self.inf_scale_start = cust_opts['influence_scaledown_start']
+        self.inf_scale_end = cust_opts['influence_scaledown_end']
+        self.inf_scale_final_val = cust_opts['influence_scaledown_final_val']
+
+        # Use to compute increasing influence curriculum weight
+        self.steps_processed = 0
+
         # Setup the policy
         self.observations = tf.placeholder(
             tf.float32, [None] + list(observation_space.shape))
-        dist_class, logit_dim = ModelCatalog.get_action_dist(
+
+        # Add other agents actions placeholder for MOA preds
+        # Add 1 to include own action so it can be conditioned on. Note: agent's
+        # own actions will always form the first column of this tensor.
+        self.others_actions = tf.placeholder(tf.int32,
+            shape=(None, self.num_other_agents + 1), name="others_actions")
+
+        # 0/1 multiplier array representing whether each agent is visible to
+        # the current agent.
+        if self.train_moa_only_when_visible:
+            self.others_visibility = tf.placeholder(tf.int32,
+                shape=(None, self.num_other_agents), name="others_visibility")
+        else:
+            self.others_visibility = None
+
+        dist_class, self.num_actions = ModelCatalog.get_action_dist(
             action_space, self.config["model"])
         prev_actions = ModelCatalog.get_action_placeholder(action_space)
         prev_rewards = tf.placeholder(tf.float32, [None], name="prev_reward")
-        self.model = ModelCatalog.get_model({
-            "obs": self.observations,
-            "prev_actions": prev_actions,
-            "prev_rewards": prev_rewards,
-            "is_training": self._get_is_training_placeholder(),
-        }, observation_space, logit_dim, self.config["model"])
-        action_dist = dist_class(self.model.outputs)
-        self.vf = self.model.value_function()
+
+        # Compute output size of model of other agents (MOA)
+        self.moa_dim = self.num_actions * self.num_other_agents
+
+        # We now create two models, one for the policy, and one for the model
+        # of other agents (MOA)
+        self.rl_model, self.moa = ModelCatalog.get_double_lstm_model({
+                "obs": self.observations,
+                "others_actions": self.others_actions,
+                "prev_actions": prev_actions,
+                "prev_rewards": prev_rewards,
+                "is_training": self._get_is_training_placeholder(),
+            }, observation_space, self.num_actions, self.moa_dim,
+            self.config["model"], lstm1_name="policy", lstm2_name="moa")
+
+        action_dist = dist_class(self.rl_model.outputs)
+        self.action_probs = tf.nn.softmax(self.rl_model.outputs)
+        self.vf = self.rl_model.value_function()
         self.var_list = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
                                           tf.get_variable_scope().name)
 
@@ -75,19 +181,33 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
                     action_space))
         advantages = tf.placeholder(tf.float32, [None], name="advantages")
         self.v_target = tf.placeholder(tf.float32, [None], name="v_target")
-        self.loss = A3CLoss(action_dist, actions, advantages, self.v_target,
+        self.rl_loss = A3CLoss(action_dist, actions, advantages, self.v_target,
                             self.vf, self.config["vf_loss_coeff"],
                             self.config["entropy_coeff"])
+
+        # Setup the MOA loss
+        self.moa_preds = tf.reshape( # Reshape to [B,N,A]
+            self.moa.outputs, [-1, self.num_other_agents, self.num_actions])
+        self.moa_loss = MOALoss(self.moa_preds, self.others_actions,
+                                self.num_actions, loss_weight=self.moa_weight,
+                                others_visibility=self.others_visibility)
+        self.moa_action_probs = tf.nn.softmax(self.moa_preds)
+
+        # Total loss
+        self.total_loss = self.rl_loss.total_loss + self.moa_loss.total_loss
 
         # Initialize TFPolicyGraph
         loss_in = [
             ("obs", self.observations),
+            ("others_actions", self.others_actions),
             ("actions", actions),
             ("prev_actions", prev_actions),
             ("prev_rewards", prev_rewards),
             ("advantages", advantages),
             ("value_targets", self.v_target),
         ]
+        if self.train_moa_only_when_visible:
+            loss_in.append(('others_visibility', self.others_visibility))
         LearningRateSchedule.__init__(self, self.config["lr"],
                                       self.config["lr_schedule"])
         TFPolicyGraph.__init__(
@@ -98,72 +218,117 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
             obs_input=self.observations,
             action_sampler=action_dist.sample(),
             action_prob=action_dist.sampled_action_prob(),
-            loss=self.loss.total_loss,
-            model=self.model,
+            loss=self.total_loss,
+            model=self.rl_model,
             loss_inputs=loss_in,
-            state_inputs=self.model.state_in,
-            state_outputs=self.model.state_out,
+            state_inputs=self.rl_model.state_in + self.moa.state_in,
+            state_outputs=self.rl_model.state_out + self.moa.state_out,
             prev_action_input=prev_actions,
             prev_reward_input=prev_rewards,
-            seq_lens=self.model.seq_lens,
+            seq_lens=self.rl_model.seq_lens,
             max_seq_len=self.config["model"]["max_seq_len"])
 
-        self.stats_fetches = {
-            "stats": {
-                "cur_lr": tf.cast(self.cur_lr, tf.float64),
-                "policy_loss": self.loss.pi_loss,
-                "policy_entropy": self.loss.entropy,
-                "grad_gnorm": tf.global_norm(self._grads),
-                "var_gnorm": tf.global_norm(self.var_list),
-                "vf_loss": self.loss.vf_loss,
-                "vf_explained_var": explained_variance(self.v_target, self.vf),
-            },
+        self.total_influence = tf.get_variable("total_influence", initializer=tf.constant(0.0))
+
+        self.stats = {
+            "cur_lr": tf.cast(self.cur_lr, tf.float64),
+            "policy_loss": self.rl_loss.pi_loss,
+            "policy_entropy": self.rl_loss.entropy,
+            "grad_gnorm": tf.global_norm(self._grads),
+            "var_gnorm": tf.global_norm(self.var_list),
+            "vf_loss": self.rl_loss.vf_loss,
+            "vf_explained_var": explained_variance(self.v_target, self.vf),
+            "moa_loss": self.moa_loss.total_loss,
+            "total_influence": self.total_influence
         }
 
         self.sess.run(tf.global_variables_initializer())
 
     @override(PolicyGraph)
     def get_initial_state(self):
-        return self.model.state_init
+        return self.rl_model.state_init + self.moa.state_init
+
+    @override(TFPolicyGraph)
+    def _build_compute_actions(self,
+                               builder,
+                               obs_batch,
+                               state_batches=None,
+                               prev_action_batch=None,
+                               prev_reward_batch=None,
+                               episodes=None):
+        state_batches = state_batches or []
+        if len(self._state_inputs) != len(state_batches):
+            raise ValueError(
+                "Must pass in RNN state batches for placeholders {}, got {}".
+                format(self._state_inputs, state_batches))
+        builder.add_feed_dict(self.extra_compute_action_feed_dict())
+
+        # Extract matrix of other agents' past actions, including agent's own
+        if type(episodes) == dict and 'all_agents_actions' in episodes.keys():
+            # Call from visualizer_rllib, change episodes format so it complies with the default format.
+            self_index = agent_name_to_idx(self.agent_id, self.agent_id)
+            # First get own action
+            all_actions = [episodes['all_agents_actions'][self_index]]
+            others_actions = [e for i, e in enumerate(
+                episodes['all_agents_actions']) if self_index != i]
+            all_actions.extend(others_actions)
+            all_actions = np.reshape(np.array(all_actions), [1, -1])
+        else:
+            own_actions = np.atleast_2d(np.array(
+                [e.prev_action for e in episodes[self.agent_id]]))
+            all_actions = self.extract_last_actions_from_episodes(
+                episodes, own_actions=own_actions)
+
+        builder.add_feed_dict({self._obs_input: obs_batch,
+                               self.others_actions: all_actions})
+
+        if state_batches:
+            seq_lens = np.ones(len(obs_batch))
+            builder.add_feed_dict({self._seq_lens: seq_lens,
+                                   self.moa.seq_lens: seq_lens})
+        if self._prev_action_input is not None and prev_action_batch:
+            builder.add_feed_dict({self._prev_action_input: prev_action_batch})
+        if self._prev_reward_input is not None and prev_reward_batch:
+            builder.add_feed_dict({self._prev_reward_input: prev_reward_batch})
+        builder.add_feed_dict({self._is_training: False})
+        builder.add_feed_dict(dict(zip(self._state_inputs, state_batches)))
+        fetches = builder.add_fetches([self._sampler] + self._state_outputs +
+                                      [self.extra_compute_action_fetches()])
+        return fetches[0], fetches[1:-1], fetches[-1]
+
+    def _get_loss_inputs_dict(self, batch):
+        # Override parent function to add seq_lens to tensor for additional LSTM
+        loss_inputs = super(A3CPolicyGraph, self)._get_loss_inputs_dict(batch)
+        loss_inputs[self.moa.seq_lens] = loss_inputs[self._seq_lens]
+        return loss_inputs
+
+    @override(TFPolicyGraph)
+    def gradients(self, optimizer):
+        grads = tf.gradients(self._loss, self.var_list)
+        grads, _ = tf.clip_by_global_norm(grads, self.config["grad_clip"])
+        clipped_grads = list(zip(grads, self.var_list))
+        return clipped_grads
+
+    @override(TFPolicyGraph)
+    def extra_compute_grad_fetches(self):
+        """Extra values to fetch and return from compute_gradients()."""
+        return {
+            "stats": self.stats,
+        }
+
+    @override(TFPolicyGraph)
+    def extra_compute_action_fetches(self):
+        """Extra values to fetch and return from compute_actions().
+
+        By default we only return action probability info (if present).
+        """
+        return dict(
+            TFPolicyGraph.extra_compute_action_fetches(self),
+            **{"vf_preds": self.vf})
 
     @override(PolicyGraph)
     def postprocess_trajectory(self,
                                sample_batch,
                                other_agent_batches=None,
                                episode=None):
-        completed = sample_batch["dones"][-1]
-        if completed:
-            last_r = 0.0
-        else:
-            next_state = []
-            for i in range(len(self.model.state_in)):
-                next_state.append([sample_batch["state_out_{}".format(i)][-1]])
-            last_r = self._value(sample_batch["new_obs"][-1], *next_state)
-        return compute_advantages(sample_batch, last_r, self.config["gamma"],
-                                  self.config["lambda"])
-
-    @override(TFPolicyGraph)
-    def gradients(self, optimizer):
-        grads = tf.gradients(self._loss, self.var_list)
-        self.grads, _ = tf.clip_by_global_norm(grads, self.config["grad_clip"])
-        clipped_grads = list(zip(self.grads, self.var_list))
-        return clipped_grads
-
-    @override(TFPolicyGraph)
-    def extra_compute_grad_fetches(self):
-        return self.stats_fetches
-
-    @override(TFPolicyGraph)
-    def extra_compute_action_fetches(self):
-        return dict(
-            TFPolicyGraph.extra_compute_action_fetches(self),
-            **{"vf_preds": self.vf})
-
-    def _value(self, ob, *args):
-        feed_dict = {self.observations: [ob], self.model.seq_lens: [1]}
-        assert len(args) == len(self.model.state_in), \
-            (args, self.model.state_in)
-        for k, v in zip(self.model.state_in, args):
-            feed_dict[k] = v
-        vf = self.sess.run(self.vf, feed_dict)
-        return vf[0]
+        return sample_batch
