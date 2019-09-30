@@ -127,20 +127,22 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         self.steps_processed = 0
 
         # Setup the policy
-        self.observations = tf.placeholder(
-            tf.float32, [None] + list(observation_space.shape))
+        self.observations = tf.placeholder(tf.float32,
+                                           [None] + list(observation_space.shape))
 
         # Add other agents actions placeholder for MOA preds
         # Add 1 to include own action so it can be conditioned on. Note: agent's
         # own actions will always form the first column of this tensor.
         self.others_actions = tf.placeholder(tf.int32,
-            shape=(None, self.num_other_agents + 1), name="others_actions")
+                                             shape=(None, self.num_other_agents + 1),
+                                             name="others_actions")
 
         # 0/1 multiplier array representing whether each agent is visible to
         # the current agent.
         if self.train_moa_only_when_visible:
             self.others_visibility = tf.placeholder(tf.int32,
-                shape=(None, self.num_other_agents), name="others_visibility")
+                                                    shape=(None, self.num_other_agents),
+                                                    name="others_visibility")
         else:
             self.others_visibility = None
 
@@ -176,17 +178,17 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         elif isinstance(action_space, gym.spaces.Discrete):
             actions = tf.placeholder(tf.int64, [None], name="ac")
         else:
-            raise UnsupportedSpaceException(
-                "Action space {} is not supported for A3C.".format(
-                    action_space))
+            raise UnsupportedSpaceException("Action space {} is not supported for A3C.".format(action_space))
         advantages = tf.placeholder(tf.float32, [None], name="advantages")
         self.v_target = tf.placeholder(tf.float32, [None], name="v_target")
-        self.rl_loss = A3CLoss(action_dist, actions, advantages, self.v_target,
-                            self.vf, self.config["vf_loss_coeff"],
-                            self.config["entropy_coeff"])
+        self.rl_loss = A3CLoss(action_dist, actions, advantages,
+                               self.v_target,
+                               self.vf,
+                               self.config["vf_loss_coeff"],
+                               self.config["entropy_coeff"])
 
         # Setup the MOA loss
-        self.moa_preds = tf.reshape( # Reshape to [B,N,A]
+        self.moa_preds = tf.reshape(  # Reshape to [B,N,A]
             self.moa.outputs, [-1, self.num_other_agents, self.num_actions])
         self.moa_loss = MOALoss(self.moa_preds, self.others_actions,
                                 self.num_actions, loss_weight=self.moa_weight,
