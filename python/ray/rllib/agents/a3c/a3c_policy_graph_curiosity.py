@@ -101,6 +101,9 @@ class CuriosityLoss(object):
 
 
 class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
+    def copy(self, existing_inputs):
+        pass
+
     def __init__(self, observation_space, action_space, config):
         config = dict(ray.rllib.agents.a3c.a3c.DEFAULT_CONFIG, **config)
         self.config = config
@@ -112,39 +115,25 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
 
         # Extract influence options
         cust_opts = config['model']['custom_options']
-        self.moa_weight = cust_opts['moa_weight']
-        self.train_moa_only_when_visible = cust_opts['train_moa_only_when_visible']
-        self.influence_reward_clip = cust_opts['influence_reward_clip']
-        self.influence_divergence_measure = cust_opts['influence_divergence_measure']
-        self.influence_reward_weight = cust_opts['influence_reward_weight']
-        self.influence_curriculum_steps = cust_opts['influence_curriculum_steps']
-        self.influence_only_when_visible = cust_opts['influence_only_when_visible']
-        self.inf_scale_start = cust_opts['influence_scaledown_start']
-        self.inf_scale_end = cust_opts['influence_scaledown_end']
-        self.inf_scale_final_val = cust_opts['influence_scaledown_final_val']
+        self.aux_loss_weight = cust_opts['aux_loss_weight']
+        self.aux_reward_clip = cust_opts['aux_reward_clip']
+        self.aux_reward_weight = cust_opts['aux_reward_weight']
+        self.aux_curriculum_steps = cust_opts['aux_curriculum_steps']
+        self.aux_scale_start = cust_opts['aux_scaledown_start']
+        self.aux_scale_end = cust_opts['aux_scaledown_end']
+        self.aux_scale_final_val = cust_opts['aux_scaledown_final_val']
 
-        # Use to compute increasing influence curriculum weight
+        # Use to compute aux curriculum weight
         self.steps_processed = 0
 
         # Setup the policy
         self.observations = tf.placeholder(tf.float32,
                                            [None] + list(observation_space.shape))
 
-        # Add other agents actions placeholder for MOA preds
-        # Add 1 to include own action so it can be conditioned on. Note: agent's
-        # own actions will always form the first column of this tensor.
-        self.others_actions = tf.placeholder(tf.int32,
-                                             shape=(None, self.num_other_agents + 1),
-                                             name="others_actions")
-
-        # 0/1 multiplier array representing whether each agent is visible to
-        # the current agent.
-        if self.train_moa_only_when_visible:
-            self.others_visibility = tf.placeholder(tf.int32,
-                                                    shape=(None, self.num_other_agents),
-                                                    name="others_visibility")
-        else:
-            self.others_visibility = None
+        # Add next encoded state placeholder for curiosity predictions
+        self.encoded_state_prediction = tf.placeholder(tf.int32,
+                                                       shape=(None, self.observation_space),
+                                                       name="encoded_state_prediction")
 
         dist_class, self.num_actions = ModelCatalog.get_action_dist(
             action_space, self.config["model"])
@@ -268,7 +257,7 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         # Extract matrix of other agents' past actions, including agent's own
         if type(episodes) == dict and 'all_agents_actions' in episodes.keys():
             # Call from visualizer_rllib, change episodes format so it complies with the default format.
-            self_index = agent_name_to_idx(self.agent_id, self.agent_id)
+            self_index = agent_name_to_idx(self.agent_id)
             # First get own action
             all_actions = [episodes['all_agents_actions'][self_index]]
             others_actions = [e for i, e in enumerate(
