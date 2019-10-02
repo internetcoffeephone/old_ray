@@ -19,34 +19,6 @@ from ray.rllib.models.catalog import ModelCatalog
 from ray.rllib.utils.annotations import override
 
 
-def kl_div(p, q):
-    """Kullback-Leibler divergence D(P || Q) for discrete probability dists
-
-    Assumes the probability dist is over the last dimension.
-
-    Taken from: https://gist.github.com/swayson/86c296aa354a555536e6765bbe726ff7
-
-    p, q : array-like, dtype=float
-    """
-    p = np.asarray(p, dtype=np.float)
-    q = np.asarray(q, dtype=np.float)
-    mask = np.where(q == 0)
-    # Prevent division by 0 errors.
-    p[mask] = 0
-    p = p / p.sum(axis=2, keepdims=1)
-
-    return np.sum(np.where((p != 0) & (q != 0), p * np.log(p / q), 0), axis=-1)
-
-
-def agent_name_to_visibility_idx(name, self_id):
-    agent_num = int(name[6])
-    self_num = int(self_id[6])
-    if agent_num > self_num:
-        return agent_num - 1
-    else:
-        return agent_num
-
-
 def agent_name_to_idx(name):
     agent_num = int(name[6])
     return agent_num
@@ -101,19 +73,12 @@ class CuriosityLoss(object):
 
 
 class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
-    def copy(self, existing_inputs):
-        pass
-
     def __init__(self, observation_space, action_space, config):
         config = dict(ray.rllib.agents.a3c.a3c.DEFAULT_CONFIG, **config)
         self.config = config
         self.sess = tf.get_default_session()
 
-        # Extract info from config
-        self.num_other_agents = config['num_other_agents']
-        self.agent_id = config['agent_id']
-
-        # Extract influence options
+        # Read curiosity options from config
         cust_opts = config['model']['custom_options']
         self.aux_loss_weight = cust_opts['aux_loss_weight']
         self.aux_reward_clip = cust_opts['aux_reward_clip']
@@ -130,29 +95,23 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         self.observations = tf.placeholder(tf.float32,
                                            [None] + list(observation_space.shape))
 
-        # Add next encoded state placeholder for curiosity predictions
-        self.encoded_state_prediction = tf.placeholder(tf.int32,
-                                                       shape=(None, self.observation_space),
-                                                       name="encoded_state_prediction")
-
         dist_class, self.num_actions = ModelCatalog.get_action_dist(
             action_space, self.config["model"])
         prev_actions = ModelCatalog.get_action_placeholder(action_space)
         prev_rewards = tf.placeholder(tf.float32, [None], name="prev_reward")
 
-        # Compute output size of model of other agents (MOA)
-        self.moa_dim = self.num_actions * self.num_other_agents
+        # Compute output size of curiosity model
+        self.aux_dim =
 
         # We now create two models, one for the policy, and one for the model
         # of other agents (MOA)
-        self.rl_model, self.moa = ModelCatalog.get_double_lstm_model({
+        self.rl_model, self.curiosity_model = ModelCatalog.get_double_lstm_model({
                 "obs": self.observations,
-                "others_actions": self.others_actions,
                 "prev_actions": prev_actions,
                 "prev_rewards": prev_rewards,
                 "is_training": self._get_is_training_placeholder(),
-            }, observation_space, self.num_actions, self.moa_dim,
-            self.config["model"], lstm1_name="policy", lstm2_name="moa")
+            }, observation_space, self.num_actions, self.aux_dim,
+            self.config["model"], lstm1_name="policy", lstm2_name="curiosity")
 
         action_dist = dist_class(self.rl_model.outputs)
         self.action_probs = tf.nn.softmax(self.rl_model.outputs)
@@ -177,11 +136,10 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
                                self.config["entropy_coeff"])
 
         # Setup the MOA loss
-        self.moa_preds = tf.reshape(  # Reshape to [B,N,A]
+        self.aux_preds = tf.reshape(  # Reshape to [B,N,A]
             self.moa.outputs, [-1, self.num_other_agents, self.num_actions])
-        self.moa_loss = MOALoss(self.moa_preds, self.others_actions,
-                                self.num_actions, loss_weight=self.moa_weight,
-                                others_visibility=self.others_visibility)
+        self.curiosity_loss = CuriosityLoss(self.aux_preds, self.others_actions,
+                                            loss_weight=self.aux_loss_weight)
         self.moa_action_probs = tf.nn.softmax(self.moa_preds)
 
         # Total loss
@@ -235,9 +193,14 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
 
         self.sess.run(tf.global_variables_initializer())
 
+    @override(TFPolicyGraph)
+    def copy(self, existing_inputs):
+        # Optional, implement to work with the multi-GPU optimizer.
+        raise NotImplementedError
+
     @override(PolicyGraph)
     def get_initial_state(self):
-        return self.rl_model.state_init + self.moa.state_init
+        return self.rl_model.state_init + self.curiosity_model.state_init
 
     @override(TFPolicyGraph)
     def _build_compute_actions(self,
@@ -323,3 +286,26 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
                                other_agent_batches=None,
                                episode=None):
         return sample_batch
+
+    def compute_curiosity_reward(self, trajectory):
+        """Compute curiosity reward of this agent
+        """
+        # TODO: B,N,A?
+        # Predict the next state. (Shape is [B, N, A]??)
+        true_logits, true_probs = self.predict_next_state(trajectory)
+
+        # Logging curiosity metrics
+        curiosity_per_agent = np.sum(curiosity_per_agent_step, axis=0)
+        total_curiosity = np.sum(curiosity_per_agent_step)
+        self.total_curiosity_reward.load(total_curiosity, session=self.sess)
+        self.curiosity_per_agent = curiosity_per_agent
+
+        # Summarize and clip influence reward
+        curiosity = np.sum(curiosity_per_agent_step, axis=-1)
+        curiosity = np.clip(curiosity, -self.aux_reward_clip,
+                            self.aux_reward_clip)
+
+        # Add to trajectory
+        trajectory['rewards'] = trajectory['rewards'] + curiosity
+
+        return trajectory
