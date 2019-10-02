@@ -27,7 +27,7 @@ DEFAULT_CONFIG = with_common_config({
     # Value Function Loss coefficient
     "vf_loss_coeff": 0.5,
     # Entropy coefficient
-    "entropy_coeff": -0.01,
+    "entropy_coeff": 0.01,
     # Min time per iteration
     "min_iter_time_s": 5,
     # Workers sample async. Note that this increases the effective
