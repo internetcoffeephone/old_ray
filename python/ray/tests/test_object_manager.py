@@ -28,12 +28,12 @@ def create_cluster(num_nodes):
     for i in range(num_nodes):
         cluster.add_node(resources={str(i): 100}, object_store_memory=10**9)
 
-    ray.init(redis_address=cluster.redis_address)
+    ray.init(address=cluster.address)
     return cluster
 
 
 @pytest.fixture()
-def ray_start_cluster():
+def ray_start_cluster_with_resource():
     num_nodes = 5
     cluster = create_cluster(num_nodes)
     yield cluster, num_nodes
@@ -43,30 +43,20 @@ def ray_start_cluster():
     cluster.shutdown()
 
 
-@pytest.fixture()
-def ray_start_empty_cluster():
-    cluster = Cluster()
-    yield cluster
-
-    # The code after the yield will run as teardown code.
-    ray.shutdown()
-    cluster.shutdown()
-
-
 # This test is here to make sure that when we broadcast an object to a bunch of
 # machines, we don't have too many excess object transfers.
-def test_object_broadcast(ray_start_cluster):
-    cluster, num_nodes = ray_start_cluster
+def test_object_broadcast(ray_start_cluster_with_resource):
+    cluster, num_nodes = ray_start_cluster_with_resource
 
     @ray.remote
     def f(x):
         return
 
-    x = np.zeros(10**8, dtype=np.uint8)
+    x = np.zeros(10 * 1024 * 1024, dtype=np.uint8)
 
     @ray.remote
     def create_object():
-        return np.zeros(10**8, dtype=np.uint8)
+        return np.zeros(10 * 1024 * 1024, dtype=np.uint8)
 
     object_ids = []
 
@@ -90,7 +80,7 @@ def test_object_broadcast(ray_start_cluster):
 
     # Wait for profiling information to be pushed to the profile table.
     time.sleep(1)
-    transfer_events = ray.global_state.chrome_tracing_object_transfer_dump()
+    transfer_events = ray.object_transfer_timeline()
 
     # Make sure that each object was transferred a reasonable number of times.
     for x_id in object_ids:
@@ -137,8 +127,8 @@ def test_object_broadcast(ray_start_cluster):
 # to the actor's object manager. However, in the past we did not deduplicate
 # the pushes and so the same object could get shipped to the same object
 # manager many times. This test checks that that isn't happening.
-def test_actor_broadcast(ray_start_cluster):
-    cluster, num_nodes = ray_start_cluster
+def test_actor_broadcast(ray_start_cluster_with_resource):
+    cluster, num_nodes = ray_start_cluster_with_resource
 
     @ray.remote
     class Actor(object):
@@ -149,8 +139,11 @@ def test_actor_broadcast(ray_start_cluster):
             pass
 
     actors = [
-        Actor._remote(args=[], kwargs={}, resources={str(i % num_nodes): 1})
-        for i in range(100)
+        Actor._remote(
+            args=[],
+            kwargs={},
+            num_cpus=0.01,
+            resources={str(i % num_nodes): 1}) for i in range(30)
     ]
 
     # Wait for the actors to start up.
@@ -159,7 +152,7 @@ def test_actor_broadcast(ray_start_cluster):
     object_ids = []
 
     # Broadcast a large object to all actors.
-    for _ in range(10):
+    for _ in range(5):
         x_id = ray.put(np.zeros(10**7, dtype=np.uint8))
         object_ids.append(x_id)
         # Pass the object into a method for every actor.
@@ -167,7 +160,7 @@ def test_actor_broadcast(ray_start_cluster):
 
     # Wait for profiling information to be pushed to the profile table.
     time.sleep(1)
-    transfer_events = ray.global_state.chrome_tracing_object_transfer_dump()
+    transfer_events = ray.object_transfer_timeline()
 
     # Make sure that each object was transferred a reasonable number of times.
     for x_id in object_ids:
@@ -212,8 +205,8 @@ def test_actor_broadcast(ray_start_cluster):
 
 # The purpose of this test is to make sure that an object that was already been
 # transferred to a node can be transferred again.
-def test_object_transfer_retry(ray_start_empty_cluster):
-    cluster = ray_start_empty_cluster
+def test_object_transfer_retry(ray_start_cluster):
+    cluster = ray_start_cluster
 
     repeated_push_delay = 4
 
@@ -226,14 +219,14 @@ def test_object_transfer_retry(ray_start_empty_cluster):
         "object_manager_pull_timeout_ms": repeated_push_delay * 1000 / 4,
         "object_manager_default_chunk_size": 1000
     })
-    object_store_memory = 10**8
+    object_store_memory = 150 * 1024 * 1024
     cluster.add_node(
         object_store_memory=object_store_memory, _internal_config=config)
     cluster.add_node(
         num_gpus=1,
         object_store_memory=object_store_memory,
         _internal_config=config)
-    ray.init(redis_address=cluster.redis_address)
+    ray.init(address=cluster.address)
 
     @ray.remote(num_gpus=1)
     def f(size):
@@ -244,8 +237,8 @@ def test_object_transfer_retry(ray_start_empty_cluster):
 
     x_ids = [f.remote(10**i) for i in [1, 2, 3, 4]]
     assert not any(
-        ray.worker.global_worker.plasma_client.contains(
-            ray.pyarrow.plasma.ObjectID(x_id.binary())) for x_id in x_ids)
+        ray.worker.global_worker.core_worker.object_exists(x_id)
+        for x_id in x_ids)
 
     # Get the objects locally to cause them to be transferred. This is the
     # first time the objects are getting transferred, so it should happen
@@ -264,8 +257,8 @@ def test_object_transfer_retry(ray_start_empty_cluster):
     for _ in range(15):
         ray.put(x)
     assert not any(
-        ray.worker.global_worker.plasma_client.contains(
-            ray.pyarrow.plasma.ObjectID(x_id.binary())) for x_id in x_ids)
+        ray.worker.global_worker.core_worker.object_exists(x_id)
+        for x_id in x_ids)
 
     end_time = time.time()
     # Make sure that the first time the objects get transferred, it happens
@@ -284,8 +277,8 @@ def test_object_transfer_retry(ray_start_empty_cluster):
     for _ in range(15):
         ray.put(x)
     assert not any(
-        ray.worker.global_worker.plasma_client.contains(
-            ray.pyarrow.plasma.ObjectID(x_id.binary())) for x_id in x_ids)
+        ray.worker.global_worker.core_worker.object_exists(x_id)
+        for x_id in x_ids)
 
     time.sleep(repeated_push_delay)
 
@@ -300,8 +293,8 @@ def test_object_transfer_retry(ray_start_empty_cluster):
 # The purpose of this test is to make sure we can transfer many objects. In the
 # past, this has caused failures in which object managers create too many open
 # files and run out of resources.
-def test_many_small_transfers(ray_start_cluster):
-    cluster, num_nodes = ray_start_cluster
+def test_many_small_transfers(ray_start_cluster_with_resource):
+    cluster, num_nodes = ray_start_cluster_with_resource
 
     @ray.remote
     def f(*args):

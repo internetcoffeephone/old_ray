@@ -13,9 +13,8 @@ class RayParams(object):
     Attributes:
         redis_address (str): The address of the Redis server to connect to. If
             this address is not provided, then this command will start Redis, a
-            global scheduler, a local scheduler, a plasma store, a plasma
-            manager, and some workers. It will also kill these processes when
-            Python exits.
+            raylet, a plasma store, a plasma manager, and some workers.
+            It will also kill these processes when Python exits.
         redis_port (int): The port that the primary Redis shard should listen
             to. If None, then a random port will be chosen.
         redis_shard_ports: A list of the ports to use for the non-primary Redis
@@ -24,6 +23,7 @@ class RayParams(object):
         num_gpus (int): Number of GPUs to configure the raylet with.
         resources: A dictionary mapping the name of a resource to the quantity
             of that resource available.
+        memory: Total available memory for workers requesting memory.
         object_store_memory: The amount of memory (in bytes) to start the
             object store with.
         redis_max_memory: The max amount of memory (in bytes) to allow redis
@@ -56,7 +56,7 @@ class RayParams(object):
         huge_pages: Boolean flag indicating whether to start the Object
             Store with hugetlbfs support. Requires plasma_directory.
         include_webui: Boolean flag indicating whether to start the web
-            UI, which is a Jupyter notebook.
+            UI, which displays the status of the Ray cluster.
         logging_level: Logging level, default will be logging.INFO.
         logging_format: Logging format, default contains a timestamp,
             filename, line number, and message. See ray_constants.py.
@@ -83,6 +83,7 @@ class RayParams(object):
                  num_cpus=None,
                  num_gpus=None,
                  resources=None,
+                 memory=None,
                  object_store_memory=None,
                  redis_max_memory=None,
                  redis_port=None,
@@ -117,8 +118,9 @@ class RayParams(object):
         self.redis_address = redis_address
         self.num_cpus = num_cpus
         self.num_gpus = num_gpus
-        self.resources = resources
+        self.memory = memory
         self.object_store_memory = object_store_memory
+        self.resources = resources
         self.redis_max_memory = redis_max_memory
         self.redis_port = redis_port
         self.redis_shard_ports = redis_shard_ports

@@ -9,6 +9,7 @@ import random
 import types
 
 from ray.tune import TuneError
+from ray.tune.sample import sample_from
 
 logger = logging.getLogger(__name__)
 
@@ -52,37 +53,6 @@ def grid_search(values):
     """
 
     return {"grid_search": values}
-
-
-class sample_from(object):
-    """Specify that tune should sample configuration values from this function.
-
-    The use of function arguments in tune configs must be disambiguated by
-    either wrapped the function in tune.eval() or tune.function().
-
-    Arguments:
-        func: An callable function to draw a sample from.
-    """
-
-    def __init__(self, func):
-        self.func = func
-
-
-class function(object):
-    """Wraps `func` to make sure it is not expanded during resolution.
-
-    The use of function arguments in tune configs must be disambiguated by
-    either wrapped the function in tune.eval() or tune.function().
-
-    Arguments:
-        func: A function literal.
-    """
-
-    def __init__(self, func):
-        self.func = func
-
-    def __call__(self, *args, **kwargs):
-        return self.func(*args, **kwargs)
 
 
 _STANDARD_IMPORTS = {
@@ -192,9 +162,7 @@ def _resolve_lambda_vars(spec, lambda_vars):
                 error = e
             except Exception:
                 raise ValueError(
-                    "Failed to evaluate expression: {}: {}".format(path, fn) +
-                    ". If you meant to pass this as a function literal, use "
-                    "tune.function() to escape it.")
+                    "Failed to evaluate expression: {}: {}".format(path, fn))
             else:
                 _assign_value(spec, path, value)
                 resolved[path] = value
@@ -237,16 +205,7 @@ def _is_resolved(v):
 
 
 def _try_resolve(v):
-    if isinstance(v, types.FunctionType):
-        raise DeprecationWarning(
-            "Function values are ambiguous in Tune "
-            "configuations. Either wrap the function with "
-            "`tune.function(func)` to specify a function literal, or "
-            "`tune.sample_from(func)` to tell Tune to "
-            "sample values from the function during variant generation: "
-            "{}".format(v))
-        return False, v
-    elif isinstance(v, sample_from):
+    if isinstance(v, sample_from):
         # Function to sample from
         return False, v.func
     elif isinstance(v, dict) and len(v) == 1 and "eval" in v:

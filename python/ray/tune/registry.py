@@ -14,8 +14,10 @@ TRAINABLE_CLASS = "trainable_class"
 ENV_CREATOR = "env_creator"
 RLLIB_MODEL = "rllib_model"
 RLLIB_PREPROCESSOR = "rllib_preprocessor"
+RLLIB_ACTION_DIST = "rllib_action_dist"
 KNOWN_CATEGORIES = [
-    TRAINABLE_CLASS, ENV_CREATOR, RLLIB_MODEL, RLLIB_PREPROCESSOR
+    TRAINABLE_CLASS, ENV_CREATOR, RLLIB_MODEL, RLLIB_PREPROCESSOR,
+    RLLIB_ACTION_DIST
 ]
 
 logger = logging.getLogger(__name__)
@@ -31,7 +33,8 @@ def register_trainable(name, trainable):
             automatically converted into a class during registration.
     """
 
-    from ray.tune.trainable import Trainable, wrap_function
+    from ray.tune.trainable import Trainable
+    from ray.tune.function_runner import wrap_function
 
     if isinstance(trainable, type):
         logger.debug("Detected class for trainable.")

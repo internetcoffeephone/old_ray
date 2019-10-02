@@ -4,10 +4,17 @@
 # cython: language_level = 3
 
 import numpy
+import time
+import logging
 
-from libc.stdint cimport int32_t, int64_t
+from libc.stdint cimport uint8_t, int32_t, int64_t
 from libcpp cimport bool as c_bool
-from libcpp.memory cimport unique_ptr
+from libcpp.memory cimport (
+    dynamic_pointer_cast,
+    make_shared,
+    shared_ptr,
+    unique_ptr,
+)
 from libcpp.string cimport string as c_string
 from libcpp.utility cimport pair
 from libcpp.unordered_map cimport unordered_map
@@ -17,31 +24,59 @@ from cython.operator import dereference, postincrement
 
 from ray.includes.common cimport (
     CLanguage,
+    CRayObject,
     CRayStatus,
+    CGcsClientOptions,
+    CTaskArg,
+    CRayFunction,
+    LocalMemoryBuffer,
     LANGUAGE_CPP,
     LANGUAGE_JAVA,
     LANGUAGE_PYTHON,
+    WORKER_TYPE_WORKER,
+    WORKER_TYPE_DRIVER,
 )
 from ray.includes.libraylet cimport (
     CRayletClient,
-    GCSProfileEventT,
-    GCSProfileTableDataT,
+    GCSProfileEvent,
+    GCSProfileTableData,
     ResourceMappingType,
     WaitResultPair,
 )
 from ray.includes.unique_ids cimport (
     CActorCheckpointID,
     CObjectID,
+    CClientID,
 )
-from ray.includes.task cimport CTaskSpecification
+from ray.includes.libcoreworker cimport CCoreWorker, CTaskOptions
+from ray.includes.task cimport CTaskSpec
 from ray.includes.ray_config cimport RayConfig
+from ray.exceptions import RayletError, ObjectStoreFullError
 from ray.utils import decode
+from ray.ray_constants import (
+    DEFAULT_PUT_OBJECT_DELAY,
+    DEFAULT_PUT_OBJECT_RETRIES,
+    RAW_BUFFER_METADATA,
+)
+
+# pyarrow cannot be imported until after _raylet finishes initializing
+# (see ray/__init__.py for details).
+# Unfortunately, Cython won't compile if 'pyarrow' is undefined, so we
+# "forward declare" it here and then replace it with a reference to the
+# imported package from ray/__init__.py.
+# TODO(edoakes): Fix this.
+pyarrow = None
 
 cimport cpython
 
 include "includes/unique_ids.pxi"
 include "includes/ray_config.pxi"
 include "includes/task.pxi"
+include "includes/buffer.pxi"
+include "includes/common.pxi"
+
+
+logger = logging.getLogger(__name__)
 
 
 if cpython.PY_MAJOR_VERSION >= 3:
@@ -56,7 +91,18 @@ cdef int check_status(const CRayStatus& status) nogil except -1:
 
     with gil:
         message = status.message().decode()
-        raise Exception(message)
+
+    if status.IsObjectStoreFull():
+        raise ObjectStoreFullError(message)
+    else:
+        raise RayletError(message)
+
+
+cdef VectorToObjectIDs(const c_vector[CObjectID] &object_ids):
+    result = []
+    for i in range(object_ids.size()):
+        result.append(ObjectID(object_ids[i].Binary()))
+    return result
 
 
 cdef c_vector[CObjectID] ObjectIDsToVector(object_ids):
@@ -72,29 +118,22 @@ cdef c_vector[CObjectID] ObjectIDsToVector(object_ids):
         ObjectID object_id
         c_vector[CObjectID] result
     for object_id in object_ids:
-        result.push_back(object_id.data)
-    return result
-
-
-cdef VectorToObjectIDs(c_vector[CObjectID] object_ids):
-    result = []
-    for i in range(object_ids.size()):
-        result.append(ObjectID(object_ids[i].binary()))
+        result.push_back(object_id.native())
     return result
 
 
 def compute_put_id(TaskID task_id, int64_t put_index):
-    if put_index < 1 or put_index > kMaxTaskPuts:
+    if put_index < 1 or put_index > <int64_t>CObjectID.MaxObjectIndex():
         raise ValueError("The range of 'put_index' should be [1, %d]"
-                         % kMaxTaskPuts)
-    return ObjectID(ComputePutId(task_id.data, put_index).binary())
+                         % CObjectID.MaxObjectIndex())
+    return ObjectID(CObjectID.ForPut(task_id.native(), put_index, 0).Binary())
 
 
 def compute_task_id(ObjectID object_id):
-    return TaskID(ComputeTaskId(object_id.data).binary())
+    return TaskID(object_id.native().TaskId().Binary())
 
 
-cdef c_bool is_simple_value(value, int *num_elements_contained):
+cdef c_bool is_simple_value(value, int64_t *num_elements_contained):
     num_elements_contained[0] += 1
 
     if num_elements_contained[0] >= RayConfig.instance().num_elements_limit():
@@ -168,7 +207,7 @@ def check_simple_value(value):
         True if the value should be send by value, False otherwise.
     """
 
-    cdef int num_elements_contained = 0
+    cdef int64_t num_elements_contained = 0
     return is_simple_value(value, &num_elements_contained)
 
 
@@ -214,71 +253,63 @@ cdef unordered_map[c_string, double] resource_map_from_dict(resource_map):
     return out
 
 
+cdef c_vector[c_string] string_vector_from_list(list string_list):
+    cdef:
+        c_vector[c_string] out
+    for s in string_list:
+        if not isinstance(s, bytes):
+            raise TypeError("string_list elements must be bytes")
+        out.push_back(s)
+    return out
+
+
 cdef class RayletClient:
-    cdef unique_ptr[CRayletClient] client
+    cdef CRayletClient* client
 
-    def __cinit__(self, raylet_socket,
-                  ClientID client_id,
-                  c_bool is_worker,
-                  DriverID driver_id):
-        # We know that we are using Python, so just skip the language
-        # parameter.
-        # TODO(suquark): Should we allow unicode chars in "raylet_socket"?
-        self.client.reset(new CRayletClient(
-            raylet_socket.encode("ascii"), client_id.data, is_worker,
-            driver_id.data, LANGUAGE_PYTHON))
+    def __cinit__(self, CoreWorker core_worker):
+        # The core worker and raylet client need to share an underlying
+        # raylet client, so we take a reference to the core worker's client
+        # here. The client is a raw pointer because it is only a temporary
+        # workaround and will be removed once the core worker transition is
+        # complete, so we don't want to change the unique_ptr in core worker
+        # to a shared_ptr. This means the core worker *must* be
+        # initialized before the raylet client.
+        self.client = &core_worker.core_worker.get().GetRayletClient()
 
-    def disconnect(self):
-        check_status(self.client.get().Disconnect())
+    def submit_task(self, TaskSpec task_spec):
+        cdef:
+            CObjectID c_id
 
-    def submit_task(self, Task task_spec):
-        check_status(self.client.get().SubmitTask(
-            task_spec.execution_dependencies.get()[0],
+        check_status(self.client.SubmitTask(
             task_spec.task_spec.get()[0]))
 
     def get_task(self):
         cdef:
-            unique_ptr[CTaskSpecification] task_spec
+            unique_ptr[CTaskSpec] task_spec
 
         with nogil:
-            check_status(self.client.get().GetTask(&task_spec))
-        return Task.make(task_spec)
+            check_status(self.client.GetTask(&task_spec))
+        return TaskSpec.make(task_spec)
 
     def task_done(self):
-        check_status(self.client.get().TaskDone())
+        check_status(self.client.TaskDone())
 
     def fetch_or_reconstruct(self, object_ids,
                              c_bool fetch_only,
                              TaskID current_task_id=TaskID.nil()):
         cdef c_vector[CObjectID] fetch_ids = ObjectIDsToVector(object_ids)
-        check_status(self.client.get().FetchOrReconstruct(
-            fetch_ids, fetch_only, current_task_id.data))
-
-    def notify_unblocked(self, TaskID current_task_id):
-        check_status(self.client.get().NotifyUnblocked(current_task_id.data))
-
-    def wait(self, object_ids, int num_returns, int64_t timeout_milliseconds,
-             c_bool wait_local, TaskID current_task_id):
-        cdef:
-            WaitResultPair result
-            c_vector[CObjectID] wait_ids
-        wait_ids = ObjectIDsToVector(object_ids)
-        with nogil:
-            check_status(self.client.get().Wait(wait_ids, num_returns,
-                                                timeout_milliseconds,
-                                                wait_local,
-                                                current_task_id.data, &result))
-        return (VectorToObjectIDs(result.first),
-                VectorToObjectIDs(result.second))
+        check_status(self.client.FetchOrReconstruct(
+            fetch_ids, fetch_only, current_task_id.native()))
 
     def resource_ids(self):
         cdef:
             ResourceMappingType resource_mapping = (
-                self.client.get().GetResourceIDs())
+                self.client.GetResourceIDs())
             unordered_map[
                 c_string, c_vector[pair[int64_t, double]]
             ].iterator iterator = resource_mapping.begin()
             c_vector[pair[int64_t, double]] c_value
+
         resources_dict = {}
         while iterator != resource_mapping.end():
             key = decode(dereference(iterator).first)
@@ -291,29 +322,29 @@ cdef class RayletClient:
             postincrement(iterator)
         return resources_dict
 
-    def push_error(self, DriverID job_id, error_type, error_message,
+    def push_error(self, JobID job_id, error_type, error_message,
                    double timestamp):
-        check_status(self.client.get().PushError(job_id.data,
-                                                 error_type.encode("ascii"),
-                                                 error_message.encode("ascii"),
-                                                 timestamp))
+        check_status(self.client.PushError(job_id.native(),
+                                           error_type.encode("ascii"),
+                                           error_message.encode("ascii"),
+                                           timestamp))
 
     def push_profile_events(self, component_type, UniqueID component_id,
                             node_ip_address, profile_data):
         cdef:
-            GCSProfileTableDataT profile_info
-            GCSProfileEventT *profile_event
+            GCSProfileTableData profile_info
+            GCSProfileEvent *profile_event
             c_string event_type
 
         if len(profile_data) == 0:
             return  # Short circuit if there are no profile events.
 
-        profile_info.component_type = component_type.encode("ascii")
-        profile_info.component_id = component_id.binary()
-        profile_info.node_ip_address = node_ip_address.encode("ascii")
+        profile_info.set_component_type(component_type.encode("ascii"))
+        profile_info.set_component_id(component_id.binary())
+        profile_info.set_node_ip_address(node_ip_address.encode("ascii"))
 
         for py_profile_event in profile_data:
-            profile_event = new GCSProfileEventT()
+            profile_event = profile_info.add_profile_events()
             if not isinstance(py_profile_event, dict):
                 raise TypeError(
                     "Incorrect type for a profile event. Expected dict "
@@ -323,62 +354,266 @@ cdef class RayletClient:
             # that will cause segfaults in the node manager.
             for key_string, event_data in py_profile_event.items():
                 if key_string == "event_type":
-                    profile_event.event_type = event_data.encode("ascii")
-                    if profile_event.event_type.length() == 0:
+                    if len(event_data) == 0:
                         raise ValueError(
                             "'event_type' should not be a null string.")
+                    profile_event.set_event_type(event_data.encode("ascii"))
                 elif key_string == "start_time":
-                    profile_event.start_time = float(event_data)
+                    profile_event.set_start_time(float(event_data))
                 elif key_string == "end_time":
-                    profile_event.end_time = float(event_data)
+                    profile_event.set_end_time(float(event_data))
                 elif key_string == "extra_data":
-                    profile_event.extra_data = event_data.encode("ascii")
-                    if profile_event.extra_data.length() == 0:
+                    if len(event_data) == 0:
                         raise ValueError(
                             "'extra_data' should not be a null string.")
+                    profile_event.set_extra_data(event_data.encode("ascii"))
                 else:
                     raise ValueError(
                         "Unknown profile event key '%s'" % key_string)
-            # Note that profile_info.profile_events is a vector of unique
-            # pointers, so profile_event will be deallocated when profile_info
-            # goes out of scope. "emplace_back" of vector has not been
-            # supported by Cython
-            profile_info.profile_events.push_back(
-                unique_ptr[GCSProfileEventT](profile_event))
 
-        check_status(self.client.get().PushProfileEvents(profile_info))
-
-    def free_objects(self, object_ids, c_bool local_only):
-        cdef c_vector[CObjectID] free_ids = ObjectIDsToVector(object_ids)
-        check_status(self.client.get().FreeObjects(free_ids, local_only))
+        check_status(self.client.PushProfileEvents(profile_info))
 
     def prepare_actor_checkpoint(self, ActorID actor_id):
-        cdef CActorCheckpointID checkpoint_id
-        cdef CActorID c_actor_id = actor_id.data
+        cdef:
+            CActorCheckpointID checkpoint_id
+            CActorID c_actor_id = actor_id.native()
+
         # PrepareActorCheckpoint will wait for raylet's reply, release
         # the GIL so other Python threads can run.
         with nogil:
-            check_status(self.client.get().PrepareActorCheckpoint(
+            check_status(self.client.PrepareActorCheckpoint(
                 c_actor_id, checkpoint_id))
-        return ActorCheckpointID(checkpoint_id.binary())
+        return ActorCheckpointID(checkpoint_id.Binary())
 
     def notify_actor_resumed_from_checkpoint(self, ActorID actor_id,
                                              ActorCheckpointID checkpoint_id):
-        check_status(self.client.get().NotifyActorResumedFromCheckpoint(
-            actor_id.data, checkpoint_id.data))
+        check_status(self.client.NotifyActorResumedFromCheckpoint(
+            actor_id.native(), checkpoint_id.native()))
+
+    def set_resource(self, basestring resource_name,
+                     double capacity, ClientID client_id):
+        self.client.SetResource(resource_name.encode("ascii"), capacity,
+                                CClientID.FromBinary(client_id.binary()))
 
     @property
-    def language(self):
-        return Language.from_native(self.client.get().GetLanguage())
-
-    @property
-    def client_id(self):
-        return ClientID(self.client.get().GetClientID().binary())
-
-    @property
-    def driver_id(self):
-        return DriverID(self.client.get().GetDriverID().binary())
+    def job_id(self):
+        return JobID(self.client.GetJobID().Binary())
 
     @property
     def is_worker(self):
-        return self.client.get().IsWorker()
+        return self.client.IsWorker()
+
+
+cdef class CoreWorker:
+    cdef unique_ptr[CCoreWorker] core_worker
+
+    def __cinit__(self, is_driver, store_socket, raylet_socket,
+                  JobID job_id, GcsClientOptions gcs_options, log_dir):
+        self.core_worker.reset(new CCoreWorker(
+            WORKER_TYPE_DRIVER if is_driver else WORKER_TYPE_WORKER,
+            LANGUAGE_PYTHON, store_socket.encode("ascii"),
+            raylet_socket.encode("ascii"), job_id.native(),
+            gcs_options.native()[0], log_dir.encode("utf-8"), NULL, False))
+
+        assert pyarrow is not None, ("Expected pyarrow to be imported from "
+                                     "outside _raylet. See __init__.py for "
+                                     "details.")
+
+    def disconnect(self):
+        with nogil:
+            self.core_worker.get().Disconnect()
+
+    def get_objects(self, object_ids, TaskID current_task_id):
+        cdef:
+            c_vector[shared_ptr[CRayObject]] results
+            CTaskID c_task_id = current_task_id.native()
+            c_vector[CObjectID] c_object_ids = ObjectIDsToVector(object_ids)
+
+        with nogil:
+            check_status(self.core_worker.get().Objects().Get(
+                c_object_ids, -1, &results))
+
+        data_metadata_pairs = []
+        for result in results:
+            # core_worker will return a nullptr for objects that couldn't be
+            # retrieved from the store or if an object was an exception.
+            if not result.get():
+                data_metadata_pairs.append((None, None))
+            else:
+                data = None
+                metadata = None
+                if result.get().HasData():
+                    data = Buffer.make(result.get().GetData())
+                if result.get().HasMetadata():
+                    metadata = Buffer.make(
+                        result.get().GetMetadata()).to_pybytes()
+                data_metadata_pairs.append((data, metadata))
+
+        return data_metadata_pairs
+
+    def object_exists(self, ObjectID object_id):
+        cdef:
+            c_bool has_object
+            CObjectID c_object_id = object_id.native()
+
+        with nogil:
+            check_status(self.core_worker.get().Objects().Contains(
+                c_object_id, &has_object))
+
+        return has_object
+
+    def put_serialized_object(self, serialized_object, ObjectID object_id,
+                              int memcopy_threads=6):
+        cdef:
+            shared_ptr[CBuffer] data
+            shared_ptr[CBuffer] metadata
+            CObjectID c_object_id = object_id.native()
+            size_t data_size
+
+        data_size = serialized_object.total_bytes
+
+        with nogil:
+            check_status(self.core_worker.get().Objects().Create(
+                        metadata, data_size, c_object_id, &data))
+
+        # If data is nullptr, that means the ObjectID already existed,
+        # which we ignore.
+        # TODO(edoakes): this is hacky, we should return the error instead
+        # and deal with it here.
+        if not data:
+            return
+
+        stream = pyarrow.FixedSizeBufferWriter(
+            pyarrow.py_buffer(Buffer.make(data)))
+        stream.set_memcopy_threads(memcopy_threads)
+        serialized_object.write_to(stream)
+
+        with nogil:
+            check_status(self.core_worker.get().Objects().Seal(c_object_id))
+
+    def put_raw_buffer(self, c_string value, ObjectID object_id,
+                       int memcopy_threads=6):
+        cdef:
+            c_string metadata_str = RAW_BUFFER_METADATA
+            CObjectID c_object_id = object_id.native()
+            shared_ptr[CBuffer] data
+            shared_ptr[CBuffer] metadata = dynamic_pointer_cast[
+                CBuffer, LocalMemoryBuffer](
+                    make_shared[LocalMemoryBuffer](
+                        <uint8_t*>(metadata_str.data()), metadata_str.size()))
+
+        with nogil:
+            check_status(self.core_worker.get().Objects().Create(
+                metadata, value.size(), c_object_id, &data))
+
+        stream = pyarrow.FixedSizeBufferWriter(
+            pyarrow.py_buffer(Buffer.make(data)))
+        stream.set_memcopy_threads(memcopy_threads)
+        stream.write(pyarrow.py_buffer(value))
+
+        with nogil:
+            check_status(self.core_worker.get().Objects().Seal(c_object_id))
+
+    def wait(self, object_ids, int num_returns, int64_t timeout_milliseconds,
+             TaskID current_task_id):
+        cdef:
+            WaitResultPair result
+            c_vector[CObjectID] wait_ids
+            c_vector[c_bool] results
+            CTaskID c_task_id = current_task_id.native()
+
+        wait_ids = ObjectIDsToVector(object_ids)
+        with nogil:
+            check_status(self.core_worker.get().Objects().Wait(
+                wait_ids, num_returns, timeout_milliseconds, &results))
+
+        assert len(results) == len(object_ids)
+
+        ready, not_ready = [], []
+        for i, object_id in enumerate(object_ids):
+            if results[i]:
+                ready.append(object_id)
+            else:
+                not_ready.append(object_id)
+
+        return (ready, not_ready)
+
+    def free_objects(self, object_ids, c_bool local_only,
+                     c_bool delete_creating_tasks):
+        cdef:
+            c_vector[CObjectID] free_ids = ObjectIDsToVector(object_ids)
+
+        with nogil:
+            check_status(self.core_worker.get().Objects().Delete(
+                free_ids, local_only, delete_creating_tasks))
+
+    def set_current_task_id(self, TaskID task_id):
+        cdef:
+            CTaskID c_task_id = task_id.native()
+
+        with nogil:
+            self.core_worker.get().SetCurrentTaskId(c_task_id)
+
+    def set_current_job_id(self, JobID job_id):
+        cdef:
+            CJobID c_job_id = job_id.native()
+
+        with nogil:
+            self.core_worker.get().SetCurrentJobId(c_job_id)
+
+    def submit_task(self,
+                    function_descriptor,
+                    args,
+                    int num_return_vals,
+                    resources):
+        cdef:
+            unordered_map[c_string, double] c_resources
+            CTaskOptions task_options
+            CRayFunction ray_function
+            c_vector[CTaskArg] args_vector
+            c_vector[CObjectID] return_ids
+            c_string pickled_str
+            shared_ptr[CBuffer] arg_data
+            shared_ptr[CBuffer] arg_metadata
+
+        c_resources = resource_map_from_dict(resources)
+        task_options = CTaskOptions(num_return_vals, c_resources)
+        ray_function = CRayFunction(
+            LANGUAGE_PYTHON, string_vector_from_list(function_descriptor))
+
+        for arg in args:
+            if isinstance(arg, ObjectID):
+                args_vector.push_back(
+                    CTaskArg.PassByReference((<ObjectID>arg).native()))
+            else:
+                pickled_str = pickle.dumps(
+                    arg, protocol=pickle.HIGHEST_PROTOCOL)
+                arg_data = dynamic_pointer_cast[CBuffer, LocalMemoryBuffer](
+                        make_shared[LocalMemoryBuffer](
+                            <uint8_t*>(pickled_str.data()),
+                            pickled_str.size(),
+                            True))
+                args_vector.push_back(
+                    CTaskArg.PassByValue(
+                        make_shared[CRayObject](arg_data, arg_metadata)))
+
+        with nogil:
+            check_status(self.core_worker.get().Tasks().SubmitTask(
+                ray_function, args_vector, task_options, &return_ids))
+
+        return VectorToObjectIDs(return_ids)
+
+    def set_object_store_client_options(self, c_string client_name,
+                                        int64_t limit_bytes):
+        with nogil:
+            check_status(self.core_worker.get().Objects().SetClientOptions(
+                client_name, limit_bytes))
+
+    def object_store_memory_usage_string(self):
+        cdef:
+            c_string message
+
+        with nogil:
+            message = self.core_worker.get().Objects().MemoryUsageString()
+
+        return message.decode("utf-8")

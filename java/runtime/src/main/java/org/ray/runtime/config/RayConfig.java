@@ -1,21 +1,20 @@
 package org.ray.runtime.config;
 
-
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigException;
 import com.typesafe.config.ConfigFactory;
 import com.typesafe.config.ConfigValue;
-
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import org.ray.api.id.UniqueId;
+import org.ray.api.id.JobId;
+import org.ray.runtime.generated.Common.WorkerType;
 import org.ray.runtime.util.NetworkUtil;
 import org.ray.runtime.util.ResourceUtil;
-import org.ray.runtime.util.StringUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,12 +29,11 @@ public class RayConfig {
   public static final String DEFAULT_CONFIG_FILE = "ray.default.conf";
   public static final String CUSTOM_CONFIG_FILE = "ray.conf";
 
-  public final String rayHome;
   public final String nodeIp;
-  public final WorkerMode workerMode;
+  public final WorkerType workerMode;
   public final RunMode runMode;
   public final Map<String, Double> resources;
-  public final UniqueId driverId;
+  private JobId jobId;
   public final String logDir;
   public final boolean redirectOutput;
   public final List<String> libraryPath;
@@ -56,11 +54,7 @@ public class RayConfig {
   public final String rayletSocketName;
   public final List<String> rayletConfigParameters;
 
-  public final String redisServerExecutablePath;
-  public final String redisModulePath;
-  public final String plasmaStoreExecutablePath;
-  public final String rayletExecutablePath;
-  public final String driverResourcePath;
+  public final String jobResourcePath;
   public final String pythonWorkerCommand;
 
   /**
@@ -68,13 +62,12 @@ public class RayConfig {
    */
   public final int numberExecThreadsForDevRuntime;
 
+  public final int numWorkersPerProcess;
+
   private void validate() {
-    if (workerMode == WorkerMode.WORKER) {
+    if (workerMode == WorkerType.WORKER) {
       Preconditions.checkArgument(redisAddress != null,
           "Redis address must be set in worker mode.");
-    } else {
-      Preconditions.checkArgument(!rayHome.isEmpty(),
-          "'ray.home' must be set in driver mode");
     }
   }
 
@@ -87,32 +80,24 @@ public class RayConfig {
   }
 
   public RayConfig(Config config) {
-    // worker mode
-    WorkerMode localWorkerMode;
+    // Worker mode.
+    WorkerType localWorkerMode;
     try {
-      localWorkerMode = config.getEnum(WorkerMode.class, "ray.worker.mode");
+      localWorkerMode = config.getEnum(WorkerType.class, "ray.worker.mode");
     } catch (ConfigException.Missing e) {
-      localWorkerMode = WorkerMode.DRIVER;
+      localWorkerMode = WorkerType.DRIVER;
     }
-
     workerMode = localWorkerMode;
-    boolean isDriver = workerMode == WorkerMode.DRIVER;
-    // run mode
+    boolean isDriver = workerMode == WorkerType.DRIVER;
+    // Run mode.
     runMode = config.getEnum(RunMode.class, "ray.run-mode");
-    // ray home
-    String localRayHome = config.getString("ray.home");
-    if (!localRayHome.startsWith("/")) {
-      // If ray.home isn't an absolute path, prepend it with current work dir.
-      localRayHome = System.getProperty("user.dir") + "/" + localRayHome;
-    }
-    rayHome = removeTrailingSlash(localRayHome);
-    // node ip
+    // Node ip.
     String nodeIp = config.getString("ray.node-ip");
     if (nodeIp.isEmpty()) {
       nodeIp = NetworkUtil.getIpAddress(null);
     }
     this.nodeIp = nodeIp;
-    // resources
+    // Resources.
     resources = ResourceUtil.getResourcesMapFromString(
         config.getString("ray.resources"));
     if (isDriver) {
@@ -122,27 +107,23 @@ public class RayConfig {
             + "setting it to the number of CPU cores: {}", numCpu);
         resources.put("CPU", numCpu * 1.0);
       }
-      if (!resources.containsKey("GPU")) {
-        LOGGER.warn("No GPU resource is set in configuration, setting it to 0");
-        resources.put("GPU", 0.0);
-      }
     }
-    // driver id
-    String driverId = config.getString("ray.driver.id");
-    if (!driverId.isEmpty()) {
-      this.driverId = UniqueId.fromHexString(driverId);
+    // Job id.
+    String jobId = config.getString("ray.job.id");
+    if (!jobId.isEmpty()) {
+      this.jobId = JobId.fromHexString(jobId);
     } else {
-      this.driverId = UniqueId.randomId();
+      this.jobId = JobId.NIL;
     }
-    // log dir
+    // Log dir.
     logDir = removeTrailingSlash(config.getString("ray.log-dir"));
-    // redirect output
+    // Redirect output.
     redirectOutput = config.getBoolean("ray.redirect-output");
-    // custom library path
-    List<String> customLibraryPath = config.getStringList("ray.library.path");
-    // custom classpath
+    // Library path.
+    libraryPath = config.getStringList("ray.library.path");
+    // Custom classpath.
     classpath = config.getStringList("ray.classpath");
-    // custom worker jvm parameters
+    // Custom worker jvm parameters.
     if (config.hasPath("ray.worker.jvm-parameters")) {
       jvmParameters = config.getStringList("ray.worker.jvm-parameters");
     } else {
@@ -155,7 +136,7 @@ public class RayConfig {
       pythonWorkerCommand = null;
     }
 
-    // redis configurations
+    // Redis configurations.
     String redisAddress = config.getString("ray.redis.address");
     if (!redisAddress.isEmpty()) {
       setRedisAddress(redisAddress);
@@ -167,44 +148,34 @@ public class RayConfig {
     headRedisPassword = config.getString("ray.redis.head-password");
     redisPassword = config.getString("ray.redis.password");
 
-    // object store configurations
+    // Object store configurations.
     objectStoreSocketName = config.getString("ray.object-store.socket-name");
     objectStoreSize = config.getBytes("ray.object-store.size");
 
-    // raylet socket name
+    // Raylet socket name.
     rayletSocketName = config.getString("ray.raylet.socket-name");
 
-    // raylet parameters
-    rayletConfigParameters = new ArrayList<String>();
+    // Raylet parameters.
+    rayletConfigParameters = new ArrayList<>();
     Config rayletConfig = config.getConfig("ray.raylet.config");
     for (Map.Entry<String,ConfigValue> entry : rayletConfig.entrySet()) {
-      String parameter = entry.getKey() + "," + String.valueOf(entry.getValue().unwrapped());
+      String parameter = entry.getKey() + "," + entry.getValue().unwrapped();
       rayletConfigParameters.add(parameter);
     }
 
-    // library path
-    this.libraryPath = new ImmutableList.Builder<String>().add(
-        rayHome + "/build/src/plasma",
-        rayHome + "/build/src/ray/raylet"
-    ).addAll(customLibraryPath).build();
-
-    redisServerExecutablePath = rayHome +
-        "/build/src/ray/thirdparty/redis/src/redis-server";
-    redisModulePath = rayHome + "/build/src/ray/gcs/redis_module/libray_redis_module.so";
-    plasmaStoreExecutablePath = rayHome + "/build/src/plasma/plasma_store_server";
-    rayletExecutablePath = rayHome + "/build/src/ray/raylet/raylet";
-
-    // driver resource path
-    if (config.hasPath("ray.driver.resource-path")) {
-      driverResourcePath = config.getString("ray.driver.resource-path");
+    // Job resource path.
+    if (config.hasPath("ray.job.resource-path")) {
+      jobResourcePath = config.getString("ray.job.resource-path");
     } else {
-      driverResourcePath = null;
+      jobResourcePath = null;
     }
 
     // Number of threads that execute tasks.
     numberExecThreadsForDevRuntime = config.getInt("ray.dev-runtime.execution-parallelism");
 
-    // validate config
+    numWorkersPerProcess = config.getInt("ray.raylet.config.num_workers_per_process_java");
+
+    // Validate config.
     validate();
     LOGGER.debug("Created config: {}", this);
   }
@@ -232,15 +203,22 @@ public class RayConfig {
     return redisPort;
   }
 
+  public void setJobId(JobId jobId) {
+    this.jobId = jobId;
+  }
+
+  public JobId getJobId() {
+    return this.jobId;
+  }
+
   @Override
   public String toString() {
     return "RayConfig{"
-        + "rayHome='" + rayHome + '\''
         + ", nodeIp='" + nodeIp + '\''
         + ", workerMode=" + workerMode
         + ", runMode=" + runMode
         + ", resources=" + resources
-        + ", driverId=" + driverId
+        + ", jobId=" + jobId
         + ", logDir='" + logDir + '\''
         + ", redirectOutput=" + redirectOutput
         + ", libraryPath=" + libraryPath
@@ -255,11 +233,7 @@ public class RayConfig {
         + ", objectStoreSize=" + objectStoreSize
         + ", rayletSocketName='" + rayletSocketName + '\''
         + ", rayletConfigParameters=" + rayletConfigParameters
-        + ", redisServerExecutablePath='" + redisServerExecutablePath + '\''
-        + ", redisModulePath='" + redisModulePath + '\''
-        + ", plasmaStoreExecutablePath='" + plasmaStoreExecutablePath + '\''
-        + ", rayletExecutablePath='" + rayletExecutablePath + '\''
-        + ", driverResourcePath='" + driverResourcePath + '\''
+        + ", jobResourcePath='" + jobResourcePath + '\''
         + ", pythonWorkerCommand='" + pythonWorkerCommand + '\''
         + '}';
   }
@@ -274,7 +248,7 @@ public class RayConfig {
     ConfigFactory.invalidateCaches();
     Config config = ConfigFactory.systemProperties();
     String configPath = System.getProperty("ray.config");
-    if (StringUtil.isNullOrEmpty(configPath)) {
+    if (Strings.isNullOrEmpty(configPath)) {
       LOGGER.info("Loading config from \"ray.conf\" file in classpath.");
       config = config.withFallback(ConfigFactory.load(CUSTOM_CONFIG_FILE));
     } else {

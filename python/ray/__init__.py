@@ -5,6 +5,13 @@ from __future__ import print_function
 import os
 import sys
 
+# MUST import ray._raylet before pyarrow to initialize some global variables.
+# It seems the library related to memory allocation in pyarrow will destroy the
+# initialization of grpc if we import pyarrow at first.
+# NOTE(JoeyJiang): See https://github.com/ray-project/ray/issues/5219 for more
+# details.
+import ray._raylet
+
 if "pyarrow" in sys.modules:
     raise ImportError("Ray must be imported before pyarrow because Ray "
                       "requires a specific version of pyarrow (which is "
@@ -26,6 +33,15 @@ If you are using Anaconda, try fixing this problem by running:
 
 try:
     import pyarrow  # noqa: F401
+
+    # pyarrow is not imported inside of _raylet because of the issue described
+    # above. In order for Cython to compile _raylet, pyarrow is set to None
+    # in _raylet instead, so we give _raylet a real reference to it here.
+    # We first do the attribute checks here so that building the documentation
+    # succeeds without fully installing ray..
+    # TODO(edoakes): Fix this.
+    if hasattr(ray, "_raylet") and hasattr(ray._raylet, "pyarrow"):
+        ray._raylet.pyarrow = pyarrow
 except ImportError as e:
     if ((hasattr(e, "msg") and isinstance(e.msg, str)
          and ("libstdc++" in e.msg or "CXX" in e.msg))):
@@ -46,9 +62,6 @@ except ImportError as e:
             e.args += (helpful_message, )
     raise
 
-modin_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "modin")
-sys.path.append(modin_path)
-
 from ray._raylet import (
     ActorCheckpointID,
     ActorClassID,
@@ -56,7 +69,8 @@ from ray._raylet import (
     ActorID,
     ClientID,
     Config as _Config,
-    DriverID,
+    JobID,
+    WorkerID,
     FunctionID,
     ObjectID,
     TaskID,
@@ -66,19 +80,19 @@ from ray._raylet import (
 _config = _Config()
 
 from ray.profiling import profile  # noqa: E402
+from ray.state import (global_state, jobs, nodes, tasks, objects, timeline,
+                       object_transfer_timeline, cluster_resources,
+                       available_resources, errors)  # noqa: E402
 from ray.worker import (
     LOCAL_MODE,
-    PYTHON_MODE,
     SCRIPT_MODE,
     WORKER_MODE,
     connect,
     disconnect,
-    error_info,
     get,
     get_gpu_ids,
     get_resource_ids,
     get_webui_url,
-    global_state,
     init,
     is_initialized,
     put,
@@ -88,6 +102,7 @@ from ray.worker import (
     wait,
 )  # noqa: E402
 import ray.internal  # noqa: E402
+import ray.projects  # noqa: E402
 # We import ray.actor because some code is run in actor.py which initializes
 # some functions in the worker.
 import ray.actor  # noqa: F401
@@ -95,9 +110,19 @@ from ray.actor import method  # noqa: E402
 from ray.runtime_context import _get_runtime_context  # noqa: E402
 
 # Ray version string.
-__version__ = "0.7.0.dev1"
+__version__ = "0.7.5"
 
 __all__ = [
+    "global_state",
+    "jobs",
+    "nodes",
+    "tasks",
+    "objects",
+    "timeline",
+    "object_transfer_timeline",
+    "cluster_resources",
+    "available_resources",
+    "errors",
     "LOCAL_MODE",
     "PYTHON_MODE",
     "SCRIPT_MODE",
@@ -108,17 +133,16 @@ __all__ = [
     "actor",
     "connect",
     "disconnect",
-    "error_info",
     "get",
     "get_gpu_ids",
     "get_resource_ids",
     "get_webui_url",
-    "global_state",
     "init",
     "internal",
     "is_initialized",
     "method",
     "profile",
+    "projects",
     "put",
     "register_custom_serializer",
     "remote",
@@ -133,7 +157,8 @@ __all__ += [
     "ActorHandleID",
     "ActorID",
     "ClientID",
-    "DriverID",
+    "JobID",
+    "WorkerID",
     "FunctionID",
     "ObjectID",
     "TaskID",

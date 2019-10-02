@@ -2,102 +2,121 @@ package org.ray.runtime;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
+import java.io.File;
+import java.io.IOException;
 import java.lang.reflect.Field;
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
-import org.apache.commons.lang3.ArrayUtils;
-import org.ray.api.Checkpointable.Checkpoint;
+import org.apache.commons.io.FileUtils;
+import org.ray.api.id.JobId;
 import org.ray.api.id.UniqueId;
 import org.ray.runtime.config.RayConfig;
-import org.ray.runtime.config.WorkerMode;
+import org.ray.runtime.context.NativeWorkerContext;
+import org.ray.runtime.gcs.GcsClient;
+import org.ray.runtime.gcs.GcsClientOptions;
 import org.ray.runtime.gcs.RedisClient;
-import org.ray.runtime.generated.ActorCheckpointIdData;
-import org.ray.runtime.generated.TablePrefix;
-import org.ray.runtime.objectstore.ObjectStoreProxy;
-import org.ray.runtime.raylet.RayletClientImpl;
+import org.ray.runtime.generated.Common.WorkerType;
+import org.ray.runtime.object.NativeObjectStore;
 import org.ray.runtime.runner.RunManager;
-import org.ray.runtime.util.UniqueIdUtil;
+import org.ray.runtime.task.NativeTaskExecutor;
+import org.ray.runtime.task.NativeTaskSubmitter;
+import org.ray.runtime.task.TaskExecutor;
+import org.ray.runtime.util.FileUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * native runtime for local box and cluster run.
+ * Native runtime for cluster mode.
  */
 public final class RayNativeRuntime extends AbstractRayRuntime {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(RayNativeRuntime.class);
 
-  /**
-   * Redis client of the primary shard.
-   */
-  private RedisClient redisClient;
-  /**
-   * Redis clients of all shards.
-   */
-  private List<RedisClient> redisClients;
   private RunManager manager = null;
 
-  public RayNativeRuntime(RayConfig rayConfig) {
-    super(rayConfig);
+  /**
+   * The native pointer of core worker.
+   */
+  private long nativeCoreWorkerPointer;
+
+  static {
+    LOGGER.debug("Loading native libraries.");
+    // Load native libraries.
+    String[] libraries = new String[]{"core_worker_library_java"};
+    for (String library : libraries) {
+      String fileName = System.mapLibraryName(library);
+      try (FileUtil.TempFile libFile = FileUtil.getTempFileFromResource(fileName)) {
+        System.load(libFile.getFile().getAbsolutePath());
+      }
+      LOGGER.debug("Native libraries loaded.");
+    }
+
+    RayConfig globalRayConfig = RayConfig.create();
+    resetLibraryPath(globalRayConfig);
+
+    try {
+      FileUtils.forceMkdir(new File(globalRayConfig.logDir));
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to create the log directory.", e);
+    }
+    nativeSetup(globalRayConfig.logDir);
+    Runtime.getRuntime().addShutdownHook(new Thread(RayNativeRuntime::nativeShutdownHook));
   }
 
-  private void resetLibraryPath() {
+  private static void resetLibraryPath(RayConfig rayConfig) {
+    if (rayConfig.libraryPath.isEmpty()) {
+      return;
+    }
+
     String path = System.getProperty("java.library.path");
     if (Strings.isNullOrEmpty(path)) {
       path = "";
     } else {
       path += ":";
     }
-
     path += String.join(":", rayConfig.libraryPath);
 
     // This is a hack to reset library path at runtime,
     // see https://stackoverflow.com/questions/15409223/.
     System.setProperty("java.library.path", path);
-    //set sys_paths to null so that java.library.path will be re-evalueted next time it is needed
+    // Set sys_paths to null so that java.library.path will be re-evaluated next time it is needed.
     final Field sysPathsField;
     try {
       sysPathsField = ClassLoader.class.getDeclaredField("sys_paths");
       sysPathsField.setAccessible(true);
       sysPathsField.set(null, null);
     } catch (NoSuchFieldException | IllegalAccessException e) {
-      e.printStackTrace();
       LOGGER.error("Failed to set library path.", e);
     }
   }
 
-  @Override
-  public void start() throws Exception {
-    // Load native libraries.
-    try {
-      resetLibraryPath();
-      System.loadLibrary("raylet_library_java");
-      System.loadLibrary("plasma_java");
-    } catch (Exception e) {
-      LOGGER.error("Failed to load native libraries.", e);
-      throw e;
-    }
+  public RayNativeRuntime(RayConfig rayConfig) {
+    super(rayConfig);
+
+    // Reset library path at runtime.
+    resetLibraryPath(rayConfig);
 
     if (rayConfig.getRedisAddress() == null) {
       manager = new RunManager(rayConfig);
       manager.startRayProcesses(true);
     }
 
-    initRedisClients();
+    gcsClient = new GcsClient(rayConfig.getRedisAddress(), rayConfig.redisPassword);
 
+    if (rayConfig.getJobId() == JobId.NIL) {
+      rayConfig.setJobId(gcsClient.nextJobId());
+    }
     // TODO(qwang): Get object_store_socket_name and raylet_socket_name from Redis.
-    objectStoreProxy = new ObjectStoreProxy(this, rayConfig.objectStoreSocketName);
+    nativeCoreWorkerPointer = nativeInitCoreWorker(rayConfig.workerMode.getNumber(),
+        rayConfig.objectStoreSocketName, rayConfig.rayletSocketName,
+        (rayConfig.workerMode == WorkerType.DRIVER ? rayConfig.getJobId() : JobId.NIL).getBytes(),
+        new GcsClientOptions(rayConfig));
+    Preconditions.checkState(nativeCoreWorkerPointer != 0);
 
-    rayletClient = new RayletClientImpl(
-        rayConfig.rayletSocketName,
-        workerContext.getCurrentWorkerId(),
-        rayConfig.workerMode == WorkerMode.WORKER,
-        workerContext.getCurrentDriverId()
-    );
+    taskExecutor = new NativeTaskExecutor(nativeCoreWorkerPointer, this);
+    workerContext = new NativeWorkerContext(nativeCoreWorkerPointer);
+    objectStore = new NativeObjectStore(workerContext, nativeCoreWorkerPointer);
+    taskSubmitter = new NativeTaskSubmitter(nativeCoreWorkerPointer);
 
     // register
     registerWorker();
@@ -106,27 +125,38 @@ public final class RayNativeRuntime extends AbstractRayRuntime {
         rayConfig.objectStoreSocketName, rayConfig.rayletSocketName);
   }
 
-  private void initRedisClients() {
-    redisClient = new RedisClient(rayConfig.getRedisAddress(), rayConfig.redisPassword);
-    int numRedisShards = Integer.valueOf(redisClient.get("NumRedisShards", null));
-    List<String> addresses = redisClient.lrange("RedisShards", 0, -1);
-    Preconditions.checkState(numRedisShards == addresses.size());
-    redisClients = addresses.stream().map(RedisClient::new)
-        .collect(Collectors.toList());
-    redisClients.add(redisClient);
-  }
-
   @Override
   public void shutdown() {
+    if (nativeCoreWorkerPointer != 0) {
+      nativeDestroyCoreWorker(nativeCoreWorkerPointer);
+      nativeCoreWorkerPointer = 0;
+    }
     if (null != manager) {
       manager.cleanup();
     }
   }
 
+  @Override
+  public void setResource(String resourceName, double capacity, UniqueId nodeId) {
+    Preconditions.checkArgument(Double.compare(capacity, 0) >= 0);
+    if (nodeId == null) {
+      nodeId = UniqueId.NIL;
+    }
+    nativeSetResource(nativeCoreWorkerPointer, resourceName, capacity, nodeId.getBytes());
+  }
+
+  public void run() {
+    nativeRunTaskExecutor(nativeCoreWorkerPointer, taskExecutor);
+  }
+
+  /**
+   * Register this worker or driver to GCS.
+   */
   private void registerWorker() {
+    RedisClient redisClient = new RedisClient(rayConfig.getRedisAddress(), rayConfig.redisPassword);
     Map<String, String> workerInfo = new HashMap<>();
     String workerId = new String(workerContext.getCurrentWorkerId().getBytes());
-    if (rayConfig.workerMode == WorkerMode.DRIVER) {
+    if (rayConfig.workerMode == WorkerType.DRIVER) {
       workerInfo.put("node_ip_address", rayConfig.nodeIp);
       workerInfo.put("driver_id", workerId);
       workerInfo.put("start_time", String.valueOf(System.currentTimeMillis()));
@@ -144,51 +174,18 @@ public final class RayNativeRuntime extends AbstractRayRuntime {
     }
   }
 
-  /**
-   * Get the available checkpoints for the given actor ID, return a list sorted by checkpoint
-   * timestamp in descending order.
-   */
-  List<Checkpoint> getCheckpointsForActor(UniqueId actorId) {
-    List<Checkpoint> checkpoints = new ArrayList<>();
-    // TODO(hchen): implement the equivalent of Python's `GlobalState`, to avoid looping over
-    //  all redis shards..
-    String prefix = TablePrefix.name(TablePrefix.ACTOR_CHECKPOINT_ID);
-    byte[] key = ArrayUtils.addAll(prefix.getBytes(), actorId.getBytes());
-    for (RedisClient client : redisClients) {
-      byte[] result = client.get(key, null);
-      if (result == null) {
-        continue;
-      }
-      ActorCheckpointIdData data = ActorCheckpointIdData
-          .getRootAsActorCheckpointIdData(ByteBuffer.wrap(result));
+  private static native long nativeInitCoreWorker(int workerMode, String storeSocket,
+      String rayletSocket, byte[] jobId, GcsClientOptions gcsClientOptions);
 
-      UniqueId[] checkpointIds
-          = UniqueIdUtil.getUniqueIdsFromByteBuffer(data.checkpointIdsAsByteBuffer());
+  private static native void nativeRunTaskExecutor(long nativeCoreWorkerPointer,
+      TaskExecutor taskExecutor);
 
-      for (int i = 0; i < checkpointIds.length; i++) {
-        checkpoints.add(new Checkpoint(checkpointIds[i], data.timestamps(i)));
-      }
-      break;
-    }
-    checkpoints.sort((x, y) -> Long.compare(y.timestamp, x.timestamp));
-    return checkpoints;
-  }
+  private static native void nativeDestroyCoreWorker(long nativeCoreWorkerPointer);
 
+  private static native void nativeSetup(String logDir);
 
-  /**
-   * Query whether the actor exists in Gcs.
-   */
-  boolean actorExistsInGcs(UniqueId actorId) {
-    byte[] key = ArrayUtils.addAll("ACTOR".getBytes(), actorId.getBytes());
+  private static native void nativeShutdownHook();
 
-    // TODO(qwang): refactor this with `GlobalState` after this issue
-    // getting finished. https://github.com/ray-project/ray/issues/3933
-    for (RedisClient client : redisClients) {
-      if (client.exists(key)) {
-        return true;
-      }
-    }
-
-    return false;
-  }
+  private static native void nativeSetResource(long conn, String resourceName, double capacity,
+      byte[] nodeId);
 }
