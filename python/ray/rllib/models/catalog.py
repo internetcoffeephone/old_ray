@@ -21,6 +21,9 @@ from ray.rllib.models.visionnet import VisionNetwork
 from ray.rllib.models.lstm import LSTM
 from ray.rllib.utils.annotations import DeveloperAPI, PublicAPI
 
+import tensorflow.contrib.slim as slim
+from ray.rllib.models.misc import normc_initializer
+
 logger = logging.getLogger(__name__)
 
 # yapf: disable
@@ -369,17 +372,18 @@ class ModelCatalog(object):
 
     @staticmethod
     @DeveloperAPI
-    def get_double_lstm_model(input_dict,
-                  obs_space,
-                  num_outputs_lstm1,
-                  num_outputs_lstm2,
-                  options,
-                  state_in1=None,
-                  seq_lens1=None,
-                  state_in2=None,
-                  seq_lens2=None,
-                  lstm1_name='lstm1',
-                  lstm2_name='lstm2'):
+    def get_double_fc_lstm_model(input_dict,
+                                 encoded_dim_size,
+                                 obs_space,
+                                 num_outputs_lstm1,
+                                 num_outputs_lstm2,
+                                 options,
+                                 state_in1=None,
+                                 seq_lens1=None,
+                                 state_in2=None,
+                                 seq_lens2=None,
+                                 lstm1_name='lstm1',
+                                 lstm2_name='lstm2'):
         """Returns a 2 LSTM model conforming to given input and output specs.
 
         Both LSTMs are connected to the same shared feature extraction model.
@@ -387,6 +391,7 @@ class ModelCatalog(object):
         Args:
             input_dict (dict): Dict of input tensors to the model, including
                 the observation under the "obs" key.
+            encoded_dim_size (int): The size of the output of the custom model
             obs_space (Space): Observation space of the target gym env.
             num_outputs_lstm1 (int): The size of the output of the first LSTM.
             num_outputs_lstm2 (int): The size of the output of the second LSTM.
@@ -405,38 +410,42 @@ class ModelCatalog(object):
         assert isinstance(input_dict, dict)
         options = options or MODEL_DEFAULTS
         # Gets the feature extraction layers before LSTM layers
-        model = ModelCatalog._get_model(input_dict, obs_space, 
-                                        num_outputs_lstm1, options, state_in1, 
+        model = ModelCatalog._get_model(input_dict, obs_space,
+                                        encoded_dim_size, options, state_in1,
                                         seq_lens1)
 
-        # Create LSTM 1
-        with tf.variable_scope(lstm1_name):
-            copy = dict(input_dict)
-            copy["obs"] = model.last_layer
-            feature_space = gym.spaces.Box(
-                -1, 1, shape=(model.last_layer.shape[1], ), dtype=np.float32)
-            lstm1 = LSTM(copy, feature_space, num_outputs_lstm1, options, state_in1,
-                        seq_lens2)
+        names = [lstm1_name, lstm2_name]
+        outputs = [num_outputs_lstm1, num_outputs_lstm2]
+        state_ins = [state_in1, state_in2]
+        seq_lens = [seq_lens1, seq_lens2]
+        lstms = []
 
-            logger.debug("Created model {}: ({} of {}, {}, {}) -> {}, {}".format(
-                lstm1, input_dict, obs_space, state_in1, seq_lens1, lstm1.outputs,
-                lstm1.state_out))
+        # Create LSTMs
+        for i, name in enumerate(names):
+            with tf.variable_scope(name):
+                copy = dict(input_dict)
+                copy["obs"] = model.outputs
+                for j, size in enumerate(options["fcnet_hiddens"]):
+                    label = "fc-" + names[i] + "-{}".format(j)
+                    copy["obs"] = slim.fully_connected(
+                        copy["obs"],
+                        size,
+                        weights_initializer=normc_initializer(1.0),
+                        activation_fn=tf.nn.relu,
+                        scope=label)
 
-            lstm1._validate_output_shape()
+                feature_space = gym.spaces.Box(
+                    -1, 1, shape=(size,), dtype=np.float32)
+                lstm = LSTM(input_dict=copy,
+                            obs_space=feature_space,
+                            num_outputs=outputs[i],
+                            options=options,
+                            state_in=state_ins[i],
+                            seq_lens=seq_lens[i])
 
-        # Create LSTM 2
-        with tf.variable_scope(lstm2_name):
-            copy = dict(input_dict)
-            copy["obs"] = model.last_layer
-            feature_space = gym.spaces.Box(
-                -1, 1, shape=(model.last_layer.shape[1], ), dtype=np.float32)
-            lstm2 = LSTM(copy, feature_space, num_outputs_lstm2, options, state_in2,
-                        seq_lens2)
+                lstm._validate_output_shape()
+                lstms.append(lstm)
+                logger.debug("Created model {}: ({} of {}, {}, {}) -> {}, {}".format(
+                    lstm, input_dict, obs_space, state_ins[i], seq_lens[i], lstm.outputs, lstm.state_out))
 
-            logger.debug("Created model {}: ({} of {}, {}, {}) -> {}, {}".format(
-                lstm2, input_dict, obs_space, state_in1, seq_lens2, lstm2.outputs,
-                lstm2.state_out))
-
-            lstm2._validate_output_shape()
-
-        return lstm1, lstm2
+        return lstms[0], lstms[1], model
