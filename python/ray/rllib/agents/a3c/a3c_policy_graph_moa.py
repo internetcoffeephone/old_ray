@@ -129,7 +129,7 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         
         # We now create two models, one for the policy, and one for the model
         # of other agents (MOA)
-        self.rl_model, self.moa = ModelCatalog.get_double_lstm_model({
+        self.rl_model, self.moa = ModelCatalog.get_double_fc_lstm_model({
                 "obs": self.observations,
                 "others_actions": self.others_actions,
                 "prev_actions": prev_actions,
