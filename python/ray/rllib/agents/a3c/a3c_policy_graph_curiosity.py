@@ -24,6 +24,30 @@ def agent_name_to_idx(name):
     return agent_num
 
 
+def calculate_surprisal(pred_states, true_states):
+    """Surprisal with self-supervised MSE on a trajectory.
+
+     The loss is based on the difference between the predicted encoding of the observation x at t+1 based on t,
+     and the true encoding x at t+1.
+     The loss is then -log(p(xt+1)|xt, at)
+     Difference is measured as mean-squared error corresponding to a fixed-variance Gaussian density.
+
+    Returns:
+        A scalar loss tensor.
+    """
+    # Remove the prediction for the final step, since t+1 is not known for this step.
+    pred_states = pred_states[:-1, ]  # [Batch size, Size of encoded observations]
+
+    # Remove first true state, as we have nothing to predict this from.
+    # the t+1 actions of other agents from all actions at t.
+    true_states = true_states[1:, ]
+
+    # Compute log of mean squared error of difference between prediction and truth
+    mse = -np.log(np.square(true_states - pred_states).mean())
+
+    return mse
+
+
 class A3CLoss(object):
     def __init__(self,
                  action_dist,
@@ -47,9 +71,9 @@ class A3CLoss(object):
 
 class CuriosityLoss(object):
     def __init__(self, pred_states, true_states, loss_weight=1.0):
-        """Curiosity loss with supervised MSE loss on a trajectory.
+        """Surprisal with self-supervised MSE on a trajectory.
 
-        The loss is based on the difference between the predicted encoding of the observation x at t+1 based on t,
+         The loss is based on the difference between the predicted encoding of the observation x at t+1 based on t,
          and the true encoding x at t+1.
          The loss is then -log(p(xt+1)|xt, at)
          Difference is measured as mean-squared error corresponding to a fixed-variance Gaussian density.
@@ -59,14 +83,14 @@ class CuriosityLoss(object):
         """
         # Remove the prediction for the final step, since t+1 is not known for
         # this step.
-        pred_states = pred_states[:-1, :]  # [B, N]
+        pred_states = pred_states[:-1, ]  # [Batch size, Size of encoded observations]
 
         # Remove first true state, as we have nothing to predict this from.
         # the t+1 actions of other agents from all actions at t.
-        true_states = true_states[1:, :]
+        true_states = true_states[1:, ]
 
-        # Compute mean squared error of difference between prediction and truth
-        mse = tf.losses.mean_squared_error(true_states, pred_states)
+        # Compute log of mean squared error of difference between prediction and truth
+        mse = -tf.log(tf.losses.mean_squared_error(pred_states, true_states))
 
         self.total_loss = mse * loss_weight
         tf.print("Curiosity loss", self.total_loss, [self.total_loss])
@@ -96,8 +120,8 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
 
         # Compute output size of aux model
         self.encoded_dim_size = observation_space.shape[0] * \
-                            observation_space.shape[1] * \
-                            self.config['model']['conv_filters']
+                                observation_space.shape[1] * \
+                                self.config['model']['conv_filters']
 
         # Setup the policy
         self.observations = tf.placeholder(tf.float32,
@@ -114,15 +138,13 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
             action_space, self.config["model"])
         prev_actions = ModelCatalog.get_action_placeholder(action_space)
         prev_rewards = tf.placeholder(tf.float32, [None], name="prev_reward")
-        self.encoded_observations = tf.placeholder(tf.float32,
-                                                   [None, self.encoded_dim_size], name="encoded_observations")
 
         # We now create three models, one for the policy, one auxiliary task model, and an encoded state model
         self.rl_model, self.aux_model, self.encoder_model = ModelCatalog.get_double_fc_lstm_model({
-                "obs": self.observations,
-                "prev_actions": prev_actions,
-                "prev_rewards": prev_rewards,
-                "is_training": self._get_is_training_placeholder()},
+            "obs": self.observations,
+            "prev_actions": prev_actions,
+            "prev_rewards": prev_rewards,
+            "is_training": self._get_is_training_placeholder()},
             encoded_dim_size=self.encoded_dim_size,
             obs_space=observation_space,
             num_outputs_lstm1=self.num_actions,
@@ -136,6 +158,8 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         self.vf = self.rl_model.value_function()
         self.var_list = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,
                                           tf.get_variable_scope().name)
+        self.encoded_observations = self.encoder_model.outputs
+        self.predicted_observations = self.aux_model.outputs
 
         # Setup the policy loss
         if isinstance(action_space, gym.spaces.Box):
@@ -155,7 +179,7 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
 
         # Setup the aux task loss
         self.aux_loss = CuriosityLoss(pred_states=self.aux_model.outputs,
-                                      true_states=self.aux_model.outputs, # TDOD: Change to self._encoded_predictions
+                                      true_states=self.encoder_model.outputs,
                                       loss_weight=self.aux_loss_weight)
 
         # Total loss
@@ -183,8 +207,8 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
             loss=self.total_loss,
             model=self.rl_model,
             loss_inputs=loss_in,
-            state_inputs=self.rl_model.state_in + self.aux_model.state_in + self.encoder_model.state_in,
-            state_outputs=self.rl_model.state_out + self.aux_model.state_out + self.encoder_model.state_out,
+            state_inputs=self.rl_model.state_in + self.aux_model.state_in,
+            state_outputs=self.rl_model.state_out + self.aux_model.state_out,
             prev_action_input=prev_actions,
             prev_reward_input=prev_rewards,
             seq_lens=self.rl_model.seq_lens,
@@ -247,11 +271,12 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
             builder.add_feed_dict({self._prev_action_input: prev_action_batch})
         if self._prev_reward_input is not None and prev_reward_batch:
             builder.add_feed_dict({self._prev_reward_input: prev_reward_batch})
-        #if self._encoded_
+
         builder.add_feed_dict({self._is_training: False})
         builder.add_feed_dict(dict(zip(self._state_inputs, state_batches)))
         fetches = builder.add_fetches([self._sampler] + self._state_outputs +
                                       [self.extra_compute_action_fetches()])
+
         return fetches[0], fetches[1:-1], fetches[-1]
 
     def _get_loss_inputs_dict(self, batch):
@@ -282,7 +307,9 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         """
         return dict(
             TFPolicyGraph.extra_compute_action_fetches(self),
-            **{"vf_preds": self.vf})
+            **{"vf_preds": self.vf,
+               "encoded_observations": self.encoded_observations,
+               "predicted_observations": self.predicted_observations})
 
     def _value(self, ob, others_actions, prev_action, prev_reward, *args):
         """Compute the value function output for a single observation
@@ -336,18 +363,17 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         """Compute auxiliary reward of this agent
         """
         # Logging auxiliary metrics
-        aux_reward_per_agent_step = np.zeros(shape=len(trajectory['obs']), dtype=np.float32)
-        for i in range(len(trajectory['obs'])):
-            pass
+        aux_reward_per_agent_step = [calculate_surprisal(trajectory['predicted_observations'][i],
+                                                         trajectory['encoded_observations'][i])
+                                     for i in range(len(trajectory['obs']))]
 
-        aux_reward_per_agent = np.sum(aux_reward_per_agent_step, axis=0)
         total_aux_reward = np.sum(aux_reward_per_agent_step)
         self.total_aux_reward.load(total_aux_reward, session=self.sess)
 
         # Summarize and clip auxiliary reward
         aux_reward = np.sum(aux_reward_per_agent_step, axis=-1)
         aux_reward = np.clip(aux_reward, -self.aux_reward_clip,
-                            self.aux_reward_clip)
+                             self.aux_reward_clip)
 
         # Add to trajectory
         trajectory['rewards'] = trajectory['rewards'] + aux_reward
