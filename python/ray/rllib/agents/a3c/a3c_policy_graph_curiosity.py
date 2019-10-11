@@ -42,31 +42,10 @@ def calculate_surprisal(pred_states, true_states):
     # the t+1 actions of other agents from all actions at t.
     true_states = true_states[1:, ]
 
-    # Compute log of mean squared error of difference between prediction and truth
-    mse = -np.log(np.square(true_states - pred_states).mean())
+    # Compute mean squared error of difference between prediction and truth
+    mse = np.square(true_states - pred_states).mean()
 
     return mse
-
-
-class A3CLoss(object):
-    def __init__(self,
-                 action_dist,
-                 actions,
-                 advantages,
-                 v_target,
-                 vf,
-                 vf_loss_coeff=0.5,
-                 entropy_coeff=-0.01):
-        log_prob = action_dist.logp(actions)
-
-        # The "policy gradients" loss
-        self.pi_loss = -tf.reduce_sum(log_prob * advantages)
-
-        delta = vf - v_target
-        self.vf_loss = 0.5 * tf.reduce_sum(tf.square(delta))
-        self.entropy = tf.reduce_sum(action_dist.entropy())
-        self.total_loss = (self.pi_loss + self.vf_loss * vf_loss_coeff +
-                           self.entropy * entropy_coeff)
 
 
 class CuriosityLoss(object):
@@ -89,11 +68,32 @@ class CuriosityLoss(object):
         # the t+1 actions of other agents from all actions at t.
         true_states = true_states[1:, ]
 
-        # Compute log of mean squared error of difference between prediction and truth
-        mse = -tf.log(tf.losses.mean_squared_error(pred_states, true_states))
+        # Compute mean squared error of difference between prediction and truth
+        mse = tf.losses.mean_squared_error(pred_states, true_states)
 
         self.total_loss = mse * loss_weight
         tf.print("Curiosity loss", self.total_loss, [self.total_loss])
+
+
+class A3CLoss(object):
+    def __init__(self,
+                 action_dist,
+                 actions,
+                 advantages,
+                 v_target,
+                 vf,
+                 vf_loss_coeff=0.5,
+                 entropy_coeff=-0.01):
+        log_prob = action_dist.logp(actions)
+
+        # The "policy gradients" loss
+        self.pi_loss = -tf.reduce_sum(log_prob * advantages)
+
+        delta = vf - v_target
+        self.vf_loss = 0.5 * tf.reduce_sum(tf.square(delta))
+        self.entropy = tf.reduce_sum(action_dist.entropy())
+        self.total_loss = (self.pi_loss + self.vf_loss * vf_loss_coeff +
+                           self.entropy * entropy_coeff)
 
 
 class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
@@ -141,10 +141,10 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
 
         # We now create three models, one for the policy, one auxiliary task model, and an encoded state model
         self.rl_model, self.aux_model, self.encoder_model = ModelCatalog.get_double_fc_lstm_model({
-            "obs": self.observations,
-            "prev_actions": prev_actions,
-            "prev_rewards": prev_rewards,
-            "is_training": self._get_is_training_placeholder()},
+                "obs": self.observations,
+                "prev_actions": prev_actions,
+                "prev_rewards": prev_rewards,
+                "is_training": self._get_is_training_placeholder()},
             encoded_dim_size=self.encoded_dim_size,
             obs_space=observation_space,
             num_outputs_lstm1=self.num_actions,
@@ -376,7 +376,7 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
                              self.aux_reward_clip)
 
         # Add to trajectory
-        trajectory['rewards'] = trajectory['rewards'] + aux_reward
+        trajectory['rewards'] = trajectory['rewards'] + aux_reward * self.aux_reward_weight
 
         return trajectory
 
