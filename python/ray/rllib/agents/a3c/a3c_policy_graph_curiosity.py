@@ -257,11 +257,21 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         # Extract matrix of other agents' past actions, including agent's own
         if type(episodes) == dict and 'all_agents_actions' in episodes.keys():
             # Call from visualizer_rllib, change episodes format so it complies with the default format.
-            raise NotImplementedError
+            self_index = agent_name_to_idx(self.agent_id)
+            # First get own action
+            all_actions = [episodes['all_agents_actions'][self_index]]
+            others_actions = [e for i, e in enumerate(
+                episodes['all_agents_actions']) if self_index != i]
+            all_actions.extend(others_actions)
+            all_actions = np.reshape(np.array(all_actions), [1, -1])
         else:
-            pass
+            own_actions = np.atleast_2d(np.array(
+                [e.prev_action for e in episodes[self.agent_id]]))
+            all_actions = self.extract_last_actions_from_episodes(
+                episodes, own_actions=own_actions)
 
-        builder.add_feed_dict({self._obs_input: obs_batch})
+        builder.add_feed_dict({self._obs_input: obs_batch,
+                               self.others_actions: all_actions})
 
         if state_batches:
             seq_lens = np.ones(len(obs_batch))
