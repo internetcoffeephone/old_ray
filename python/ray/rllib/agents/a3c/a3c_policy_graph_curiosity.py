@@ -215,7 +215,6 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
             max_seq_len=self.config["model"]["max_seq_len"])
 
         self.total_aux_reward = tf.get_variable("total_aux_reward", initializer=tf.constant(0.0))
-        self.total_successes_int = 0
 
         self.total_successes = tf.get_variable("total_successes", initializer=tf.constant(0.0))
         self.switches_on_at_termination = tf.get_variable("switches_on_at_termination", initializer=tf.constant(0.0))
@@ -404,13 +403,13 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         total_aux_reward = np.sum(aux_reward_per_agent_step)
         self.total_aux_reward.load(total_aux_reward, session=self.sess)
 
-        # Summarize and clip auxiliary reward
-        aux_reward = np.sum(aux_reward_per_agent_step, axis=-1)
-        aux_reward = np.clip(aux_reward, -self.aux_reward_clip,
-                             self.aux_reward_clip)
+        # Clip auxiliary reward
+        aux_reward_per_agent_step = np.clip(aux_reward_per_agent_step,
+                                            -self.aux_reward_clip,
+                                             self.aux_reward_clip)
 
         # Add to trajectory
-        trajectory['rewards'] = trajectory['rewards'] + aux_reward * self.aux_reward_weight
+        trajectory['rewards'] = trajectory['rewards'] + aux_reward_per_agent_step * self.aux_reward_weight
 
         return trajectory
 
