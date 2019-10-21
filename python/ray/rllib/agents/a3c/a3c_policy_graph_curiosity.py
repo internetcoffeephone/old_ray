@@ -36,11 +36,11 @@ def calculate_surprisal(pred_states, true_states):
         A scalar loss tensor.
     """
     # Remove the prediction for the final step, since t+1 is not known for this step.
-    pred_states = pred_states[:-1, ]  # [Batch size, Size of encoded observations]
+    pred_states = pred_states[:-1]  # [Batch size, Size of encoded observations]
 
     # Remove first true state, as we have nothing to predict this from.
     # the t+1 actions of other agents from all actions at t.
-    true_states = true_states[1:, ]
+    true_states = true_states[1:]
 
     # Compute mean squared error of difference between prediction and truth
     mse = np.square(true_states - pred_states).mean()
@@ -62,11 +62,11 @@ class CuriosityLoss(object):
         """
         # Remove the prediction for the final step, since t+1 is not known for
         # this step.
-        pred_states = pred_states[:-1, ]  # [Batch size, Size of encoded observations]
+        pred_states = pred_states[:-1]  # [Batch size, Size of encoded observations]
 
         # Remove first true state, as we have nothing to predict this from.
         # the t+1 actions of other agents from all actions at t.
-        true_states = true_states[1:, ]
+        true_states = true_states[1:]
 
         # Compute mean squared error of difference between prediction and truth
         mse = tf.losses.mean_squared_error(pred_states, true_states)
@@ -216,21 +216,6 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
 
         self.total_aux_reward = tf.get_variable("total_aux_reward", initializer=tf.constant(0.0))
 
-        self.total_successes = tf.get_variable("total_successes", initializer=tf.constant(0.0))
-        self.switches_on_at_termination = tf.get_variable("switches_on_at_termination", initializer=tf.constant(0.0))
-        self.total_pulled_on = tf.get_variable("total_pulled_on", initializer=tf.constant(0.0))
-        self.total_pulled_off = tf.get_variable("total_pulled_off", initializer=tf.constant(0.0))
-        self.timestep_first_switch_pull = tf.get_variable("timestep_first_switch_pull", initializer=tf.constant(0.0))
-        self.timestep_last_switch_pull = tf.get_variable("timestep_last_switch_pull", initializer=tf.constant(0.0))
-
-        self.extra_metrics = {
-            "total_successes": self.total_successes,
-            "switches_on_at_termination": self.switches_on_at_termination,
-            "total_pulled_on": self.total_pulled_on,
-            "total_pulled_off": self.total_pulled_off,
-            "timestep_first_switch_pull": self.timestep_first_switch_pull,
-            "timestep_last_switch_pull": self.timestep_last_switch_pull}
-
         self.stats = {
             "cur_lr": tf.cast(self.cur_lr, tf.float64),
             "policy_loss": self.rl_loss.pi_loss,
@@ -241,8 +226,7 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
             "vf_explained_var": explained_variance(self.v_target, self.vf),
             "total_a3c_loss": self.rl_loss.total_loss,
             "aux_loss": self.aux_loss.total_loss,
-            "total_aux_reward": self.total_aux_reward,
-            **self.extra_metrics
+            "total_aux_reward": self.total_aux_reward
         }
 
         self.sess.run(tf.global_variables_initializer())
@@ -353,17 +337,11 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         vf = self.sess.run(self.vf, feed_dict)
         return vf[0]
 
-    def load_metrics_from_sample_batch(self, sample_batch):
-        last_info = sample_batch["infos"][-1]
-        for key, value in self.extra_metrics.items():
-            value.load(last_info[key], session=self.sess)
-
     @override(PolicyGraph)
     def postprocess_trajectory(self,
                                sample_batch,
                                other_agent_batches=None,
                                episode=None):
-        self.load_metrics_from_sample_batch(sample_batch)
         # Extract matrix of self and other agents' actions.
         own_actions = np.atleast_2d(np.array(sample_batch['actions']))
         own_actions = np.reshape(own_actions, [-1, 1])
