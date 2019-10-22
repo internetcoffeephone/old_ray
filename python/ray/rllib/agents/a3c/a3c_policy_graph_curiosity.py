@@ -299,8 +299,8 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
     @override(TFPolicyGraph)
     def gradients(self, optimizer):
         grads = tf.gradients(self._loss, self.var_list)
-        grads, _ = tf.clip_by_global_norm(grads, self.config["grad_clip"])
-        clipped_grads = list(zip(grads, self.var_list))
+        self.grads, _ = tf.clip_by_global_norm(grads, self.config["grad_clip"])
+        clipped_grads = list(zip(self.grads, self.var_list))
         return clipped_grads
 
     @override(TFPolicyGraph)
