@@ -117,6 +117,7 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
                 "var_gnorm": tf.global_norm(self.var_list),
                 "vf_loss": self.loss.vf_loss,
                 "vf_explained_var": explained_variance(self.v_target, self.vf),
+                "total_a3c_loss": self.loss.total_loss,
             },
         }
 
